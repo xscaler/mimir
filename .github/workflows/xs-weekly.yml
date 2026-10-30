@@ -52,6 +52,7 @@ jobs:
           base="${tag%-xs.*}"
           n="${tag##*-xs.}"
           echo "next=${base}-xs.$((n + 1))" >> "${GITHUB_OUTPUT}"
+          echo "next_version=${base}-xs.$((n + 1))" >> "${GITHUB_OUTPUT}"
       - name: Install Trivy
         if: steps.latest.outputs.found == 'true'
         run: |
@@ -67,22 +68,64 @@ jobs:
         if: steps.latest.outputs.found == 'true'
         env:
           VERSION: ${{ steps.latest.outputs.version }}
-          GH_ACTOR: ${{ github.actor }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TRIVY_USERNAME: ${{ github.actor }}
           TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          trivy image --ignore-unfixed --severity HIGH,CRITICAL --format json \
-            --output "${RUNNER_TEMP}/scan.json" --exit-code 0 \
+          trivy image --quiet --ignore-unfixed --severity HIGH,CRITICAL --format json \
+            --output "${RUNNER_TEMP}/published.json" --exit-code 0 \
             "${GHCR_REPO}:${VERSION}"
-          count="$(jq '[.Results[]? | .Vulnerabilities[]?] | length' "${RUNNER_TEMP}/scan.json")"
-          echo "Fixable HIGH/CRITICAL findings: ${count}"
+          jq -r '[.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
+            "${RUNNER_TEMP}/published.json" > "${RUNNER_TEMP}/published.ids"
+          count="$(wc -l < "${RUNNER_TEMP}/published.ids")"
+          echo "Fixable HIGH/CRITICAL findings in the published image: ${count}"
           echo "count=${count}" >> "${GITHUB_OUTPUT}"
-          trivy image --ignore-unfixed --severity HIGH,CRITICAL --format table --exit-code 0 \
-            "${GHCR_REPO}:${VERSION}"
-      - name: Tag and dispatch a rebuild
+      - name: Build a candidate from the same commit (amd64, not pushed)
         if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
+        env:
+          TAG: ${{ steps.latest.outputs.tag }}
+          NEXT_VERSION: ${{ steps.latest.outputs.next_version }}
+        run: |
+          set -euo pipefail
+          git checkout --detach "${TAG}"
+          build_image="$(make print-build-image)"
+          # Same recipe as xs-release.yml: upstream's make target in upstream's build image.
+          docker run --rm -v "${PWD}:/go/src/github.com/grafana/mimir" -w /go/src/github.com/grafana/mimir \
+            --entrypoint sh "${build_image}" -c \
+            "git config --global --add safe.directory '*' && make BUILD_IN_CONTAINER=false VERSION=${NEXT_VERSION} GOOS=linux GOARCH=amd64 BINARY_SUFFIX=_linux_amd64 cmd/mimir/mimir"
+          docker buildx build --load --platform linux/amd64 --provenance=false --sbom=false \
+            --build-arg=revision="$(git rev-parse --short HEAD)" \
+            --build-arg=USE_BINARY_SUFFIX=true \
+            -t xs-candidate:latest cmd/mimir/
+      - name: Compare the candidate with the published image
+        id: compare
+        if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          trivy image --quiet --ignore-unfixed --severity HIGH,CRITICAL --format json \
+            --output "${RUNNER_TEMP}/candidate.json" --exit-code 0 xs-candidate:latest
+          jq -r '[.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
+            "${RUNNER_TEMP}/candidate.json" > "${RUNNER_TEMP}/candidate.ids"
+          pub="$(wc -l < "${RUNNER_TEMP}/published.ids")"
+          cand="$(wc -l < "${RUNNER_TEMP}/candidate.ids")"
+          introduced="$(comm -13 "${RUNNER_TEMP}/published.ids" "${RUNNER_TEMP}/candidate.ids" | wc -l)"
+          # A rebuild is worth cutting only when its finding set is strictly smaller.
+          if [ "${introduced}" -eq 0 ] && [ "${cand}" -lt "${pub}" ]; then
+            echo "rebuild=true" >> "${GITHUB_OUTPUT}"
+            echo "Candidate fixes $((pub - cand)) of ${pub} findings."
+          else
+            echo "rebuild=false" >> "${GITHUB_OUTPUT}"
+            {
+              echo "### No rebuild cut"
+              echo "A rebuild from the same commit does not reduce the fixable HIGH/CRITICAL set (published ${pub}, candidate ${cand}, new ${introduced})."
+              echo "These findings need an upstream bump (Go toolchain, dependency or base image pin):"
+              echo '```'
+              cat "${RUNNER_TEMP}/candidate.ids"
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+      - name: Tag and dispatch a rebuild
+        if: steps.compare.outputs.rebuild == 'true'
         env:
           TAG: ${{ steps.latest.outputs.tag }}
           NEXT: ${{ steps.latest.outputs.next }}
