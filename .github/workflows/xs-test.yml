@@ -1,0 +1,529 @@
+# Unit tests, lint and integration tests for the xScaler Mimir fork.
+#
+# This mirrors the jobs of upstream's test-build-deploy.yml (kept untouched in
+# the tree and disabled) and reuses its make targets, build image, test
+# sharding and Go build cache layout. Left out on purpose:
+#   - deploy (pushes to Grafana's GAR), release (publishes a grafana/mimir
+#     GitHub release) and the Slack notifications: Grafana-only secrets/infra.
+#   - notify-streamingpromql-failures: PR comment bot for Grafana's vendoring flow.
+#   - build-metaconvert/query-tee/copyblocks images, build-dist and
+#     build-packages: artifacts we do not ship. The mimir image is built and
+#     scanned by xs-release.yml, mimirtool is built here for integration tests.
+name: xs-test
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - 'ci/**'
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 1'
+
+env:
+  # Set to 'true' to force Go build cache warmup on all branches.
+  # When 'false', the cache is only built on main.
+  FORCE_BUILD_CACHE_WARMUP: 'false'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xs-test-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    # Same-repo PRs are already covered by the push trigger on their branch.
+    # Every other job depends on this one, so it gates the whole workflow.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # Only the Makefile is needed to run `make print-build-image`, so we use
+      # sparse checkout to avoid fetching the entire repository.
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            Makefile
+          sparse-checkout-cone-mode: false
+      - name: Get build image from Makefile
+        id: build_image_step
+        run: echo "build_image=$(make print-build-image)" >> "$GITHUB_OUTPUT"
+    outputs:
+      build_image: ${{ steps.build_image_step.outputs.build_image }}
+
+  goversion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: prepare
+    container:
+      image: ${{ needs.prepare.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the prepare step is pinned
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run Git Config
+        run: git config --global --add safe.directory '*'
+      - name: Get Go Version
+        id: go-version
+        run: |
+          echo "version=$(make BUILD_IN_CONTAINER=false print-go-version)" >> "$GITHUB_OUTPUT"
+    outputs:
+      version: ${{ steps.go-version.outputs.version }}
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs:
+      - prepare
+      - warmup-go-build-cache-image-and-lint
+    container:
+      image: ${{ needs.prepare.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the prepare step is pinned
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restore Go build cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /go/cache
+          key: go-build-cache-image-and-lint-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-cache-image-and-lint-${{ needs.prepare.outputs.build_image }}-
+            go-build-cache-image-and-lint-
+      - name: Run Git Config
+        run: git config --global --add safe.directory '*'
+        # Commands in the Makefile are hardcoded with an assumed file structure of the CI container
+        # Symlink ensures paths specified in previous commands don’t break
+      - name: Symlink Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/grafana/mimir
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/grafana/mimir
+      - name: Lint
+        run: make BUILD_IN_CONTAINER=false lint
+      - name: Check Vendor Directory
+        run: make BUILD_IN_CONTAINER=false mod-check
+      - name: Check Protos
+        run: make BUILD_IN_CONTAINER=false check-protos
+      - name: Check Generated Node Methods
+        run: make BUILD_IN_CONTAINER=false check-node-methods
+      - name: Check Generated Documentation
+        run: make BUILD_IN_CONTAINER=false check-doc
+      - name: Check Reference Help Documentation
+        run: make BUILD_IN_CONTAINER=false check-reference-help
+      - name: Check White Noise
+        run: make BUILD_IN_CONTAINER=false check-white-noise
+      - name: Check License Header
+        run: make BUILD_IN_CONTAINER=false check-license
+      - name: Check Docker-Compose YAML
+        run: make BUILD_IN_CONTAINER=false check-mimir-microservices-mode-docker-compose-yaml
+
+  lint-jsonnet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs:
+      - prepare
+    container:
+      image: ${{ needs.prepare.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the prepare step is pinned
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run Git Config
+        run: git config --global --add safe.directory '*'
+        # Commands in the Makefile are hardcoded with an assumed file structure of the CI container
+        # Symlink ensures paths specified in previous commands don’t break
+      - name: Symlink Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/grafana/mimir
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/grafana/mimir
+      - name: Check Mixin
+        run: make BUILD_IN_CONTAINER=false check-mixin
+      - name: Check Mixin Tests
+        run: make BUILD_IN_CONTAINER=false check-mixin-tests
+      - name: Check Mixin with Mimirtool rules check
+        run: make BUILD_IN_CONTAINER=false check-mixin-mimirtool-rules
+      - name: Check Jsonnet Manifests
+        run: make BUILD_IN_CONTAINER=false check-jsonnet-manifests
+      - name: Check Jsonnet Getting Started
+        run: make BUILD_IN_CONTAINER=false check-jsonnet-getting-started
+      - name: Check Jsonnet Tests
+        run: make BUILD_IN_CONTAINER=false check-jsonnet-tests
+
+  lint-helm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs:
+      - prepare
+    container:
+      image: ${{ needs.prepare.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the prepare step is pinned
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run Git Config
+        run: git config --global --add safe.directory '*'
+        # Commands in the Makefile are hardcoded with an assumed file structure of the CI container
+        # Symlink ensures paths specified in previous commands don’t break
+      - name: Symlink Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/grafana/mimir
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/grafana/mimir
+      - name: Check Helm Tests
+        run: make BUILD_IN_CONTAINER=false check-helm-tests
+
+  # Compile integration test binaries once and save the Go build cache, so that the
+  # integration test jobs can reuse it. The cache is keyed by go.sum hash: it's rebuilt only
+  # when dependencies change. This means test jobs will still need to compile source files
+  # changed since the cache was created, but dependencies (the bulk of compilation time) and
+  # unchanged Mimir source files are cached.
+  #
+  # The cache is compiled and saved only on main by default. GitHub Actions caches created on
+  # main are accessible from all branches, while caches created on PR branches are scoped to
+  # that branch only. Building only on main keeps cache storage small and ensures all branches
+  # benefit from the shared cache. Set the FORCE_BUILD_CACHE_WARMUP env var at the top of
+  # this file to 'true' to enable cache warmup on all branches.
+  #
+  # There are three separate warmup jobs because different compilation flags produce different
+  # cache entries: integration tests (no -race), unit tests (-race), and image builds + linting
+  # (CGO_ENABLED=0, multi-arch for images, single-arch for lint).
+  #
+  # The second restore-keys tier falls back across build images, which get rebuilt for reasons
+  # unrelated to the Go toolchain. Safe: Go keys cache entries by compiler build ID.
+  warmup-go-build-cache-integration-tests:
+    needs: [goversion, prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # Sparse checkout of go.sum only, to compute the cache key without fetching the full repo.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true'
+        with:
+          persist-credentials: false
+          sparse-checkout: go.sum
+      - name: Check if Go build cache exists
+        id: check-cache
+        if: github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true'
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /home/runner/.cache/go-build
+          key: go-build-cache-integration-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+          lookup-only: true
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        with:
+          go-version: ${{ needs.goversion.outputs.version }}
+          cache: false
+      - name: Warm Go build cache
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        run: make BUILD_IN_CONTAINER=false warmup-build-cache-integration-tests
+      - name: Print Go build cache size
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        run: du -sh /home/runner/.cache/go-build
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        with:
+          path: /home/runner/.cache/go-build
+          key: go-build-cache-integration-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+
+  # Same as above but for unit tests, which compile with -race (producing different cache
+  # entries) and run inside a container.
+  warmup-go-build-cache-unit-tests:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ${{ needs.prepare.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the prepare step is pinned
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true'
+        with:
+          persist-credentials: false
+          sparse-checkout: go.sum
+      - name: Check if Go build cache exists
+        id: check-cache
+        if: github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true'
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /go/cache
+          key: go-build-cache-unit-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+          lookup-only: true
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        with:
+          persist-credentials: false
+      - name: Run Git Config
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        run: git config --global --add safe.directory '*'
+      - name: Warm Go build cache
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        run: make BUILD_IN_CONTAINER=false warmup-build-cache-unit-tests
+      - name: Print Go build cache size
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        run: du -sh /go/cache
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        with:
+          path: /go/cache
+          key: go-build-cache-unit-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+
+  # Same as the other warmup jobs but for image builds and linting, which use
+  # CGO_ENABLED=0 (no race) with -tags netgo,stringlabels.
+  warmup-go-build-cache-image-and-lint:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ${{ needs.prepare.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the prepare step is pinned
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true'
+        with:
+          persist-credentials: false
+          sparse-checkout: go.sum
+      - name: Check if Go build cache exists
+        id: check-cache
+        if: github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true'
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /go/cache
+          key: go-build-cache-image-and-lint-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+          lookup-only: true
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        with:
+          persist-credentials: false
+      - name: Run Git Config
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        run: git config --global --add safe.directory '*'
+      - name: Warm Go build cache
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        run: make BUILD_IN_CONTAINER=false warmup-build-cache-image-and-lint
+      - name: Print Go build cache size
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        run: du -sh /go/cache
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        if: steps.check-cache.outputs.cache-hit != 'true' && (github.ref == 'refs/heads/main' || env.FORCE_BUILD_CACHE_WARMUP == 'true')
+        with:
+          path: /go/cache
+          key: go-build-cache-image-and-lint-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    name: test (${{ matrix.extra_build_tags != '' && format('{0}, ', matrix.extra_build_tags) || '' }}${{ matrix.test_group_id }}, ${{ matrix.test_group_total }})
+    strategy:
+      # Do not abort other groups when one fails.
+      fail-fast: false
+      # A group's runtime is bounded by its slowest package, not by how many packages it holds,
+      # so more groups only add per-job startup and cache restore overhead.
+      matrix:
+        test_group_id:    [0, 1, 2, 3, 4]
+        test_group_total: [5]
+        extra_build_tags: ["", "nopools"]
+    needs:
+      - prepare
+      - warmup-go-build-cache-unit-tests
+    # The test job runs untrusted PR code (`go test`) and must NOT have write permissions.
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.prepare.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the prepare step is pinned
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restore Go build cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /go/cache
+          key: go-build-cache-unit-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-cache-unit-${{ needs.prepare.outputs.build_image }}-
+            go-build-cache-unit-
+      - name: Run Git Config
+        run: git config --global --add safe.directory '*'
+      - name: Symlink Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/grafana/mimir
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/grafana/mimir
+      - name: Run Tests
+        env:
+          TEST_GROUP_ID: ${{ matrix.test_group_id }}
+          TEST_GROUP_TOTAL: ${{ matrix.test_group_total }}
+          EXTRA_BUILD_TAGS: ${{ matrix.extra_build_tags }}
+        run: |
+          echo "Running unit tests (group ${TEST_GROUP_ID} of ${TEST_GROUP_TOTAL}) with build tags: ${EXTRA_BUILD_TAGS:-none} with Go version: $(go version)"
+          ./.github/workflows/scripts/run-unit-tests-group.sh --index "${TEST_GROUP_ID}" --total "${TEST_GROUP_TOTAL}"
+
+  test-docs:
+    needs: prepare
+    uses: ./.github/workflows/test-docs.yml
+    permissions:
+      contents: read
+
+  build-mimirtool-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs:
+      - prepare
+      - warmup-go-build-cache-image-and-lint
+    container:
+      image: ${{ needs.prepare.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the prepare step is pinned
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restore Go build cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /go/cache
+          key: go-build-cache-image-and-lint-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-cache-image-and-lint-${{ needs.prepare.outputs.build_image }}-
+            go-build-cache-image-and-lint-
+      - name: Build
+        uses: ./.github/actions/build-image
+        with:
+          artifact_name: docker-image-mimirtool
+          target: "./cmd/mimirtool/.uptodate"
+
+  build-race-enabled-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs:
+      - prepare
+      - warmup-go-build-cache-unit-tests
+    container:
+      image: ${{ needs.prepare.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the prepare step is pinned
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      # Race-enabled image uses CGO_ENABLED=1 -race -tags=netgo,stringlabels, same as unit tests.
+      - name: Restore Go build cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /go/cache
+          key: go-build-cache-unit-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-cache-unit-${{ needs.prepare.outputs.build_image }}-
+            go-build-cache-unit-
+      - name: Run Git Config
+        run: git config --global --add safe.directory '*'
+      - name: Install Docker Client
+        run: ./.github/workflows/scripts/install-docker.sh
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Symlink Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/grafana/mimir
+          ln -s $GITHUB_WORKSPACE/* /go/src/github.com/grafana/mimir
+      - name: Build Mimir with race-detector
+        run: |
+          make BUILD_IN_CONTAINER=false cmd/mimir/.uptodate_race
+          export IMAGE_TAG_RACE=$(make image-tag-race)
+          export MIMIR_DISTROLESS_IMAGE="grafana/mimir:$IMAGE_TAG_RACE"
+          docker save $MIMIR_DISTROLESS_IMAGE -o ./mimir_race_image_distroless
+      - name: Upload archive with race-enabled Mimir
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # We deliberately don't use the "docker-image" prefix here, as that is used to find all images published as part of a release, and we don't want this image included in the release.
+          name: test-docker-image-race-enabled-mimir
+          path: |
+            ./mimir_race_image_distroless
+
+  integration:
+    needs: [goversion, build-mimirtool-image, build-race-enabled-image, prepare, warmup-go-build-cache-integration-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      # Do not abort other groups when one fails.
+      fail-fast: false
+      # Split tests into 20 groups.
+      matrix:
+        test_group_id:    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        test_group_total: [20]
+    steps:
+      - name: Upgrade golang
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version: ${{ needs.goversion.outputs.version }}
+          cache: false # We manage caching ourselves below to maintain consistency with the other jobs that don't use setup-go.
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Restore Go build cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: /home/runner/.cache/go-build
+          key: go-build-cache-integration-${{ needs.prepare.outputs.build_image }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-cache-integration-${{ needs.prepare.outputs.build_image }}-
+            go-build-cache-integration-
+      - name: Run Git Config
+        run: git config --global --add safe.directory '*'
+      - name: Symlink Expected Path to Workspace
+        run: |
+          sudo mkdir -p /go/src/github.com/grafana/mimir
+          sudo ln -s $GITHUB_WORKSPACE/* /go/src/github.com/grafana/mimir
+      - name: Download mimirtool Docker Image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: docker-image-mimirtool
+      - name: Extract Docker Image from Archive
+        run: mkdir /tmp/images && tar xvf images.tar -C /tmp/images
+      - name: Load Mimirtool Image into Docker
+        run: |
+          export IMAGE_TAG=$(make image-tag)
+          # skopeo will by default load system-specific version of the image (linux/amd64).
+          # note that this doesn't use skopeo version from our build-image, because we don't use build-image when running integration tests.
+          # that's why we use docker run to run latest version.
+          docker run -v /tmp/images:/tmp/images -v /var/run/docker.sock:/var/run/docker.sock quay.io/skopeo/stable:v1.15.1 copy oci-archive:/tmp/images/mimirtool.oci "docker-daemon:grafana/mimirtool:$IMAGE_TAG"
+      - name: Download Archive with Docker Images
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: test-docker-image-race-enabled-mimir
+      - name: Load race-enabled mimir into Docker
+        run: |
+          export IMAGE_TAG_RACE=$(make image-tag-race)
+          docker load -i ./mimir_race_image_distroless
+          docker run "grafana/mimir:$IMAGE_TAG_RACE" --version
+      - name: Preload Images
+        # We download docker images used by integration tests so that all images are available
+        # locally and the download time doesn't account in the test execution time, which is subject
+        # to a timeout
+        run: go run ./tools/pre-pull-images | xargs -n1 -P4 docker pull
+      - name: Integration Tests
+        env:
+          TEST_GROUP_ID: ${{ matrix.test_group_id }}
+          TEST_GROUP_TOTAL: ${{ matrix.test_group_total }}
+        run: |
+          export IMAGE_TAG_RACE=$(make image-tag-race)
+          export MIMIR_IMAGE="grafana/mimir:$IMAGE_TAG_RACE"
+          export IMAGE_TAG=$(make image-tag)
+          export MIMIRTOOL_IMAGE="grafana/mimirtool:$IMAGE_TAG"
+          export MIMIR_CHECKOUT_DIR="/go/src/github.com/grafana/mimir"
+          echo "Running integration tests with image: $MIMIR_IMAGE (Mimir), $MIMIRTOOL_IMAGE (Mimirtool)"
+          echo "Running integration tests (group ${TEST_GROUP_ID} of ${TEST_GROUP_TOTAL}) with Go version: $(go version)"
+          ./.github/workflows/scripts/run-integration-tests-group.sh --index "${TEST_GROUP_ID}" --total "${TEST_GROUP_TOTAL}"

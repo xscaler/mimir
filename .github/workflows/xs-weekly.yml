@@ -1,0 +1,97 @@
+# Rebuild the latest xScaler release when its base image or toolchain has
+# fixable HIGH/CRITICAL findings. A new -xs.<n+1> tag is created on the same
+# commit and xs-release.yml is dispatched for it.
+name: xs-weekly
+
+on:
+  schedule:
+    - cron: '43 5 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: xs-weekly
+  cancel-in-progress: false
+
+env:
+  GHCR_REPO: ghcr.io/xscaler/mimir
+  TRIVY_VERSION: 0.76.1
+  TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+
+jobs:
+  rescan:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: read
+      actions: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          # The default token pushes the tag below.
+          persist-credentials: true
+      - name: Find the latest release tag
+        id: latest
+        run: |
+          set -euo pipefail
+          tag="$(git tag --list 'v*-xs.*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-xs\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          if [ -z "${tag}" ]; then
+            echo "No v*-xs.* tag exists yet, nothing to rescan."
+            echo "found=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "found=true" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${tag#v}" >> "${GITHUB_OUTPUT}"
+          base="${tag%-xs.*}"
+          n="${tag##*-xs.}"
+          echo "next=${base}-xs.$((n + 1))" >> "${GITHUB_OUTPUT}"
+      - name: Install Trivy
+        if: steps.latest.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "${RUNNER_TEMP}/trivy.tgz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  ${RUNNER_TEMP}/trivy.tgz" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/trivy"
+          tar -xzf "${RUNNER_TEMP}/trivy.tgz" -C "${RUNNER_TEMP}/trivy" trivy
+          echo "${RUNNER_TEMP}/trivy" >> "${GITHUB_PATH}"
+      - name: Scan the published image
+        id: scan
+        if: steps.latest.outputs.found == 'true'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          trivy image --ignore-unfixed --severity HIGH,CRITICAL --format json \
+            --output "${RUNNER_TEMP}/scan.json" --exit-code 0 \
+            "${GHCR_REPO}:${VERSION}"
+          count="$(jq '[.Results[]? | .Vulnerabilities[]?] | length' "${RUNNER_TEMP}/scan.json")"
+          echo "Fixable HIGH/CRITICAL findings: ${count}"
+          echo "count=${count}" >> "${GITHUB_OUTPUT}"
+          trivy image --ignore-unfixed --severity HIGH,CRITICAL --format table --exit-code 0 \
+            "${GHCR_REPO}:${VERSION}"
+      - name: Tag and dispatch a rebuild
+        if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
+        env:
+          TAG: ${{ steps.latest.outputs.tag }}
+          NEXT: ${{ steps.latest.outputs.next }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Same commit as the scanned release, the rebuild picks up patched base images.
+          commit="$(git rev-list -n 1 "${TAG}")"
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            tag -a "${NEXT}" "${commit}" -m "Rebuild of ${TAG} for patched base image"
+          git push origin "refs/tags/${NEXT}"
+          gh workflow run xs-release.yml --repo "${GITHUB_REPOSITORY}" --ref main -f tag="${NEXT}"

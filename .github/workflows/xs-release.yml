@@ -1,0 +1,421 @@
+# Build, scan, sign and publish the xScaler Mimir image.
+#
+# Release mode (tag push v*-xs.* or workflow_dispatch): build, scan, push to GHCR,
+# attest, sign, copy the same digest to ECR, sign there, verify.
+# Verify mode (any other push): build both arches and scan, nothing is pushed or signed.
+#
+# The binaries are built with upstream's make targets inside upstream's build
+# image. The image is built with upstream's cmd/mimir/Dockerfile and the same
+# buildx arguments as the push-multiarch-cmd/mimir/.uptodate make target.
+name: xs-release
+
+on:
+  push:
+    branches:
+      - main
+      - 'ci/**'
+    tags:
+      - 'v*-xs.*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build, for example v3.2.3-xs.0'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: xs-release-${{ github.event_name }}-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: mimir
+  GHCR_REPO: ghcr.io/xscaler/mimir
+  ECR_REPO: 483075907540.dkr.ecr.eu-west-1.amazonaws.com/xscaler/mimir
+  TRIVY_VERSION: 0.76.1
+  TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+
+jobs:
+  prepare:
+    # Same-repo PRs are already covered by the push trigger on their branch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.meta.outputs.mode }}
+      ref: ${{ steps.meta.outputs.ref }}
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      build_image: ${{ steps.ver.outputs.build_image }}
+    steps:
+      - name: Resolve release metadata
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag=""
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            tag="${INPUT_TAG}"
+          elif [ "${REF_TYPE}" = "tag" ]; then
+            tag="${REF_NAME}"
+          fi
+          if [ -n "${tag}" ]; then
+            if ! printf '%s' "${tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-xs\.[0-9]+$'; then
+              echo "::error::tag '${tag}' does not match v<upstream-version>-xs.<n>"
+              exit 1
+            fi
+            echo "mode=release" >> "${GITHUB_OUTPUT}"
+            echo "ref=refs/tags/${tag}" >> "${GITHUB_OUTPUT}"
+            echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+            echo "version=${tag#v}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "mode=verify" >> "${GITHUB_OUTPUT}"
+            echo "ref=${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+            echo "tag=" >> "${GITHUB_OUTPUT}"
+            echo "version=" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.meta.outputs.ref }}
+          persist-credentials: false
+      - name: Resolve version and build image
+        id: ver
+        env:
+          MODE: ${{ steps.meta.outputs.mode }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          upstream="$(cat VERSION)"
+          if [ "${MODE}" = "release" ]; then
+            if [ "${VERSION%-xs.*}" != "${upstream}" ]; then
+              echo "::error::tag version '${VERSION}' does not match upstream VERSION '${upstream}'"
+              exit 1
+            fi
+          else
+            VERSION="${upstream}-xs.0"
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "build_image=$(make print-build-image)" >> "${GITHUB_OUTPUT}"
+
+  binaries:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [amd64, arm64]
+    container:
+      image: ${{ needs.prepare.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the prepare step is pinned
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+      - name: Run Git Config
+        run: git config --global --add safe.directory '*'
+      - name: Symlink Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/grafana/mimir
+          ln -s "$GITHUB_WORKSPACE"/* /go/src/github.com/grafana/mimir
+      - name: Build mimir binary
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Same recipe as push-multiarch-cmd/mimir/.uptodate. VERSION feeds the
+          # upstream ldflags (pkg/util/version.Version).
+          make BUILD_IN_CONTAINER=false VERSION="${VERSION}" GOOS=linux GOARCH="${ARCH}" \
+            BINARY_SUFFIX="_linux_${ARCH}" cmd/mimir/mimir
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mimir-linux-${{ matrix.arch }}
+          path: cmd/mimir/mimir_linux_${{ matrix.arch }}
+          retention-days: 1
+          if-no-files-found: error
+
+  image:
+    needs: [prepare, binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+      - name: Download binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mimir-linux-*
+          path: cmd/mimir
+          merge-multiple: true
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Build multi-arch image to an OCI archive
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          chmod +x cmd/mimir/mimir_linux_*
+          # Same arguments as push-multiarch-cmd/mimir/.uptodate, with xScaler OCI labels
+          # layered on top of the Dockerfile's own.
+          docker buildx build \
+            -o "type=oci,dest=${RUNNER_TEMP}/mimir.oci" \
+            --platform linux/amd64,linux/arm64 \
+            --provenance=false --sbom=false \
+            --build-arg=revision="$(git rev-parse --short HEAD)" \
+            --build-arg=USE_BINARY_SUFFIX=true \
+            --label org.opencontainers.image.source=https://github.com/xscaler/mimir \
+            --label org.opencontainers.image.licenses=AGPL-3.0-only \
+            --label org.opencontainers.image.version="${VERSION}" \
+            --label org.opencontainers.image.revision="${REVISION}" \
+            -t "${GHCR_REPO}:${VERSION}" cmd/mimir/
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "${RUNNER_TEMP}/trivy.tgz" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  ${RUNNER_TEMP}/trivy.tgz" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/trivy"
+          tar -xzf "${RUNNER_TEMP}/trivy.tgz" -C "${RUNNER_TEMP}/trivy" trivy
+          echo "${RUNNER_TEMP}/trivy" >> "${GITHUB_PATH}"
+      - name: Extract one OCI layout per platform
+        run: |
+          set -euo pipefail
+          command -v skopeo >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq skopeo; }
+          # Trivy reads a single-platform OCI layout directory.
+          for arch in amd64 arm64; do
+            skopeo copy --override-os linux --override-arch "${arch}" \
+              "oci-archive:${RUNNER_TEMP}/mimir.oci" "oci:${RUNNER_TEMP}/layout-${arch}:latest"
+          done
+      - name: Trivy scan (report and SARIF)
+        env:
+          TRIVY_DISABLE_VEX_NOTICE: 'true'
+        run: |
+          set -euo pipefail
+          # One layout per platform, extracted from the multi-arch OCI archive.
+          for arch in amd64 arm64; do
+            trivy image --input "${RUNNER_TEMP}/layout-${arch}" \
+              --severity HIGH,CRITICAL --ignore-unfixed --format sarif \
+              --output "${RUNNER_TEMP}/trivy-${arch}.sarif" --exit-code 0
+            trivy image --input "${RUNNER_TEMP}/layout-${arch}" \
+              --severity HIGH,CRITICAL --format table --exit-code 0
+          done
+      - name: Upload SARIF (amd64)
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-amd64.sarif
+          category: trivy-mimir-amd64
+      - name: Upload SARIF (arm64)
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ runner.temp }}/trivy-arm64.sarif
+          category: trivy-mimir-arm64
+      - name: Trivy gate (fixable CRITICAL fails the build)
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            trivy image --input "${RUNNER_TEMP}/layout-${arch}" \
+              --severity CRITICAL --ignore-unfixed --exit-code 1
+          done
+      - name: Upload OCI archive
+        if: needs.prepare.outputs.mode == 'release'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mimir-oci
+          path: ${{ runner.temp }}/mimir.oci
+          retention-days: 1
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, image]
+    if: needs.prepare.outputs.mode == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    outputs:
+      digest: ${{ steps.ghcr.outputs.digest }}
+    steps:
+      - name: Check out helper scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Download OCI archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mimir-oci
+          path: ${{ runner.temp }}
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_crane
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Push to GHCR unless the tag already exists
+        id: ghcr
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          rc=0
+          existing="$(xs_digest "${GHCR_REPO}:${VERSION}")" || rc=$?
+          case "${rc}" in
+            0)
+              echo "${GHCR_REPO}:${VERSION} already exists at ${existing}, keeping it."
+              echo "pushed=false" >> "${GITHUB_OUTPUT}"
+              echo "digest=${existing}" >> "${GITHUB_OUTPUT}"
+              exit 0
+              ;;
+            1) ;;
+            *) exit 1 ;;
+          esac
+          command -v skopeo >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq skopeo; }
+          skopeo copy --all --retry-times 3 --digestfile "${RUNNER_TEMP}/digest" \
+            "oci-archive:${RUNNER_TEMP}/mimir.oci" "docker://${GHCR_REPO}:${VERSION}"
+          echo "pushed=true" >> "${GITHUB_OUTPUT}"
+          echo "digest=$(cat "${RUNNER_TEMP}/digest")" >> "${GITHUB_OUTPUT}"
+      - name: Generate SBOM (SPDX JSON)
+        if: steps.ghcr.outputs.pushed == 'true'
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.GHCR_REPO }}@${{ steps.ghcr.outputs.digest }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/mimir.spdx.json
+          upload-artifact: false
+      - name: Attest SBOM
+        if: steps.ghcr.outputs.pushed == 'true'
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/xscaler/mimir
+          subject-digest: ${{ steps.ghcr.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/mimir.spdx.json
+          push-to-registry: true
+      - name: Attest build provenance
+        if: steps.ghcr.outputs.pushed == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/xscaler/mimir
+          subject-digest: ${{ steps.ghcr.outputs.digest }}
+          push-to-registry: true
+      - name: Ensure the GHCR image is signed
+        env:
+          DIGEST: ${{ steps.ghcr.outputs.digest }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_ensure_signed "${GHCR_REPO}" "${DIGEST}"
+
+  publish-ecr:
+    # Separate job: an ECR failure (for example the terraform change not applied yet)
+    # leaves the GHCR release intact and can be re-run on its own.
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      DIGEST: ${{ needs.publish.outputs.digest }}
+    steps:
+      - name: Check out helper scripts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_OPS_ECR_PUSH_ROLE_ARN }}
+          aws-region: eu-west-1
+      - name: Log in to ECR
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_crane
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Copy the same digest to ECR
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          if ! xs_copy_digest "${GHCR_REPO}" "${DIGEST}" "${ECR_REPO}" "${VERSION}"; then
+            echo "::error::ECR copy failed. The ECR repository xscaler/mimir and the GitHub OIDC trust for xscaler/mimir come from the pending terraform change; check it was applied. ECR tags are immutable."
+            exit 1
+          fi
+      - name: Ensure the ECR image is signed
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_ensure_signed "${ECR_REPO}" "${DIGEST}"
+      - name: Verify signatures and version
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          for repo in "${GHCR_REPO}" "${ECR_REPO}"; do
+            cosign verify \
+              --certificate-identity-regexp "${XS_IDENTITY_REGEXP}" \
+              --certificate-oidc-issuer "${XS_OIDC_ISSUER}" \
+              "${repo}@${DIGEST}" > /dev/null
+            echo "cosign verify ok: ${repo}@${DIGEST}"
+            out="$(docker run --rm --platform linux/amd64 "${repo}@${DIGEST}" -version)"
+            echo "${out}"
+            case "${out}" in
+              *"version ${VERSION} "*) ;;
+              *) echo "::error::${repo} reports a version other than ${VERSION}"; exit 1 ;;
+            esac
+          done
+      - name: Summary
+        run: |
+          {
+            echo "### mimir ${VERSION}"
+            echo "- ${GHCR_REPO}:${VERSION}@${DIGEST}"
+            echo "- ${ECR_REPO}:${VERSION}@${DIGEST}"
+          } >> "${GITHUB_STEP_SUMMARY}"
