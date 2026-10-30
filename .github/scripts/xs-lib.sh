@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
 # Shared helpers for the xs-* workflows. Source this file, do not execute it.
-# Every downloaded tool is pinned by version and sha256.
+# Every downloaded tool is pinned by version and sha256. Only cosign has an arm64 variant: the
+# arm runner only verifies.
 
 XS_OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 CRANE_VERSION="0.22.1"
 CRANE_SHA256="0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0"
 COSIGN_VERSION="3.1.4"
-COSIGN_SHA256="424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa"
+COSIGN_SHA256_AMD64="424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa"
+COSIGN_SHA256_ARM64="ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2"
 SYFT_VERSION="1.55.0"
 SYFT_SHA256="bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d"
 TRIVY_VERSION="0.76.1"
@@ -46,9 +48,14 @@ xs_install_crane() {
 }
 
 xs_install_cosign() {
-  local dir
+  local dir arch sha
   dir="$(_xs_bindir)"
-  _xs_fetch "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-amd64" "${COSIGN_SHA256}" "${dir}/cosign"
+  case "$(uname -m)" in
+    x86_64) arch=amd64; sha="${COSIGN_SHA256_AMD64}" ;;
+    aarch64) arch=arm64; sha="${COSIGN_SHA256_ARM64}" ;;
+    *) echo "unsupported architecture $(uname -m)" >&2; return 1 ;;
+  esac
+  _xs_fetch "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-${arch}" "${sha}" "${dir}/cosign"
   chmod +x "${dir}/cosign"
 }
 
