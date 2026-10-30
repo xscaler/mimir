@@ -1,6 +1,12 @@
-# Rebuild the latest xScaler release when its base image or toolchain has
-# fixable HIGH/CRITICAL findings. A new -xs.<n+1> tag is created on the same
-# commit and xs-release.yml is dispatched for it.
+# Rebuild the latest xScaler release when its base image or toolchain has fixable
+# HIGH/CRITICAL findings and a rebuild would actually fix some of them.
+#
+# GitHub disables scheduled workflows after 60 days without repository activity. The upstream
+# sync (A2) keeps the repository active, so this schedule keeps running.
+#
+# The rebuild is cut by dispatching xs-release.yml with the next tag and the commit. The release
+# workflow creates the git tag only after the image is published and verified, so a failed
+# release leaves no tag behind.
 name: xs-weekly
 
 on:
@@ -16,16 +22,14 @@ concurrency:
 
 env:
   GHCR_REPO: ghcr.io/xscaler/mimir
-  TRIVY_VERSION: 0.76.1
-  TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
 
 jobs:
   rescan:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 150
     permissions:
-      contents: write
+      contents: read
       packages: read
       actions: write
     steps:
@@ -34,78 +38,118 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-          # The default token pushes the tag below.
-          persist-credentials: true
-      - name: Find the latest release tag
+          persist-credentials: false
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install crane and Trivy
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_crane
+          xs_install_trivy
+      - name: Find the latest published release
         id: latest
         run: |
           set -euo pipefail
-          tag="$(git tag --list 'v*-xs.*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-xs\.[0-9]+$' | sort -V | tail -n 1 || true)"
-          if [ -z "${tag}" ]; then
+          . .github/scripts/xs-lib.sh
+          export LC_ALL=C
+          # Release tags only: upstream pre-release versions never match this pattern.
+          tags="$(git tag --list 'v*-xs.*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-xs\.[0-9]+$' | sort -V -r || true)"
+          if [ -z "${tags}" ]; then
             echo "No v*-xs.* tag exists yet, nothing to rescan."
             echo "found=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          echo "found=true" >> "${GITHUB_OUTPUT}"
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "version=${tag#v}" >> "${GITHUB_OUTPUT}"
-          base="${tag%-xs.*}"
-          n="${tag##*-xs.}"
-          echo "next=${base}-xs.$((n + 1))" >> "${GITHUB_OUTPUT}"
-          echo "next_version=${base}-xs.$((n + 1))" >> "${GITHUB_OUTPUT}"
-      - name: Install Trivy
-        if: steps.latest.outputs.found == 'true'
-        run: |
-          set -euo pipefail
-          curl -fsSL -o "${RUNNER_TEMP}/trivy.tgz" \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          echo "${TRIVY_SHA256}  ${RUNNER_TEMP}/trivy.tgz" | sha256sum -c -
-          mkdir -p "${RUNNER_TEMP}/trivy"
-          tar -xzf "${RUNNER_TEMP}/trivy.tgz" -C "${RUNNER_TEMP}/trivy" trivy
-          echo "${RUNNER_TEMP}/trivy" >> "${GITHUB_PATH}"
-      - name: Scan the published image
+          # The highest tag whose image exists in GHCR.
+          latest=""
+          while read -r t; do
+            rc=0
+            xs_digest "${GHCR_REPO}:${t#v}" > /dev/null || rc=$?
+            case "${rc}" in
+              0) latest="${t}"; break ;;
+              1) echo "${t} has no image in GHCR, skipping." ;;
+              *) exit 1 ;;
+            esac
+          done <<< "${tags}"
+          if [ -z "${latest}" ]; then
+            echo "No tag has a published image, nothing to rescan."
+            echo "found=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          base="${latest%-xs.*}"
+          # Next n is one more than the highest n of ALL tags of this version, published or not.
+          max_n="$(git tag --list "${base}-xs.*" | sed -n 's/.*-xs\.\([0-9][0-9]*\)$/\1/p' | sort -n | tail -n 1)"
+          {
+            echo "found=true"
+            echo "tag=${latest}"
+            echo "version=${latest#v}"
+            echo "commit=$(git rev-list -n 1 "refs/tags/${latest}")"
+            echo "next_tag=${base}-xs.$((max_n + 1))"
+            echo "next_version=${base#v}-xs.$((max_n + 1))"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Scan the published image (amd64 and arm64)
         id: scan
         if: steps.latest.outputs.found == 'true'
         env:
           VERSION: ${{ steps.latest.outputs.version }}
           TRIVY_USERNAME: ${{ github.actor }}
           TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          TRIVY_DISABLE_VEX_NOTICE: 'true'
         run: |
           set -euo pipefail
-          trivy image --quiet --ignore-unfixed --severity HIGH,CRITICAL --format json \
-            --output "${RUNNER_TEMP}/published.json" --exit-code 0 \
-            "${GHCR_REPO}:${VERSION}"
-          jq -r '[.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
-            "${RUNNER_TEMP}/published.json" > "${RUNNER_TEMP}/published.ids"
+          export LC_ALL=C
+          : > "${RUNNER_TEMP}/published.ids"
+          for arch in amd64 arm64; do
+            trivy image --quiet --platform "linux/${arch}" --ignore-unfixed --severity HIGH,CRITICAL \
+              --format json --output "${RUNNER_TEMP}/published-${arch}.json" --exit-code 0 "${GHCR_REPO}:${VERSION}"
+            jq -r --arg a "${arch}" '[.Results[]? | .Vulnerabilities[]? | "\($a) \(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
+              "${RUNNER_TEMP}/published-${arch}.json" >> "${RUNNER_TEMP}/published.ids"
+          done
+          sort -u -o "${RUNNER_TEMP}/published.ids" "${RUNNER_TEMP}/published.ids"
           count="$(wc -l < "${RUNNER_TEMP}/published.ids")"
           echo "Fixable HIGH/CRITICAL findings in the published image: ${count}"
           echo "count=${count}" >> "${GITHUB_OUTPUT}"
-      - name: Build a candidate from the same commit (amd64, not pushed)
+      - name: Build a candidate from the same commit (both arches, not pushed)
         if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
         env:
-          TAG: ${{ steps.latest.outputs.tag }}
+          COMMIT: ${{ steps.latest.outputs.commit }}
           NEXT_VERSION: ${{ steps.latest.outputs.next_version }}
         run: |
           set -euo pipefail
-          git checkout --detach "${TAG}"
+          git checkout -q --detach "${COMMIT}"
           build_image="$(make print-build-image)"
-          # Same recipe as xs-release.yml: upstream's make target in upstream's build image.
-          docker run --rm -v "${PWD}:/go/src/github.com/grafana/mimir" -w /go/src/github.com/grafana/mimir \
-            --entrypoint sh "${build_image}" -c \
-            "git config --global --add safe.directory '*' && make BUILD_IN_CONTAINER=false VERSION=${NEXT_VERSION} GOOS=linux GOARCH=amd64 BINARY_SUFFIX=_linux_amd64 cmd/mimir/mimir"
-          docker buildx build --load --platform linux/amd64 --provenance=false --sbom=false \
-            --build-arg=revision="$(git rev-parse --short HEAD)" \
-            --build-arg=USE_BINARY_SUFFIX=true \
-            -t xs-candidate:latest cmd/mimir/
+          for arch in amd64 arm64; do
+            # Same recipe as xs-release.yml: upstream's make target in upstream's build image.
+            docker run --rm -v "${PWD}:/go/src/github.com/grafana/mimir" -w /go/src/github.com/grafana/mimir \
+              --entrypoint sh "${build_image}" -c \
+              "git config --global --add safe.directory '*' && make BUILD_IN_CONTAINER=false VERSION=${NEXT_VERSION} GOOS=linux GOARCH=${arch} BINARY_SUFFIX=_linux_${arch} cmd/mimir/mimir"
+            docker buildx build -o "type=oci,dest=${RUNNER_TEMP}/candidate-${arch}.tar" \
+              --platform "linux/${arch}" --provenance=false --sbom=false \
+              --build-arg=revision="$(git rev-parse --short HEAD)" \
+              --build-arg=USE_BINARY_SUFFIX=true cmd/mimir/
+            mkdir "${RUNNER_TEMP}/candidate-${arch}"
+            tar -xf "${RUNNER_TEMP}/candidate-${arch}.tar" -C "${RUNNER_TEMP}/candidate-${arch}"
+          done
       - name: Compare the candidate with the published image
         id: compare
         if: steps.latest.outputs.found == 'true' && steps.scan.outputs.count != '0'
+        env:
+          TRIVY_DISABLE_VEX_NOTICE: 'true'
         run: |
           set -euo pipefail
-          trivy image --quiet --ignore-unfixed --severity HIGH,CRITICAL --format json \
-            --output "${RUNNER_TEMP}/candidate.json" --exit-code 0 xs-candidate:latest
-          jq -r '[.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
-            "${RUNNER_TEMP}/candidate.json" > "${RUNNER_TEMP}/candidate.ids"
+          export LC_ALL=C
+          : > "${RUNNER_TEMP}/candidate.ids"
+          for arch in amd64 arm64; do
+            trivy image --quiet --input "${RUNNER_TEMP}/candidate-${arch}" --ignore-unfixed --severity HIGH,CRITICAL \
+              --format json --output "${RUNNER_TEMP}/candidate-${arch}.json" --exit-code 0
+            jq -r --arg a "${arch}" '[.Results[]? | .Vulnerabilities[]? | "\($a) \(.VulnerabilityID) \(.PkgName)"] | unique | .[]' \
+              "${RUNNER_TEMP}/candidate-${arch}.json" >> "${RUNNER_TEMP}/candidate.ids"
+          done
+          sort -u -o "${RUNNER_TEMP}/candidate.ids" "${RUNNER_TEMP}/candidate.ids"
           pub="$(wc -l < "${RUNNER_TEMP}/published.ids")"
           cand="$(wc -l < "${RUNNER_TEMP}/candidate.ids")"
           introduced="$(comm -13 "${RUNNER_TEMP}/published.ids" "${RUNNER_TEMP}/candidate.ids" | wc -l)"
@@ -124,17 +168,13 @@ jobs:
               echo '```'
             } >> "${GITHUB_STEP_SUMMARY}"
           fi
-      - name: Tag and dispatch a rebuild
+      - name: Dispatch the release workflow
         if: steps.compare.outputs.rebuild == 'true'
         env:
-          TAG: ${{ steps.latest.outputs.tag }}
-          NEXT: ${{ steps.latest.outputs.next }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXT: ${{ steps.latest.outputs.next_tag }}
+          COMMIT: ${{ steps.latest.outputs.commit }}
         run: |
           set -euo pipefail
-          # Same commit as the scanned release, the rebuild picks up patched base images.
-          commit="$(git rev-list -n 1 "${TAG}")"
-          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            tag -a "${NEXT}" "${commit}" -m "Rebuild of ${TAG} for patched base image"
-          git push origin "refs/tags/${NEXT}"
-          gh workflow run xs-release.yml --repo "${GITHUB_REPOSITORY}" --ref main -f tag="${NEXT}"
+          gh workflow run xs-release.yml --repo "${GITHUB_REPOSITORY}" --ref main -f tag="${NEXT}" -f commit="${COMMIT}"
+          echo "Dispatched xs-release for ${NEXT} at ${COMMIT}." >> "${GITHUB_STEP_SUMMARY}"
