@@ -58,7 +58,13 @@ Params:
 {{- $componentSection := include "mimir.componentSectionFromName" . | fromYaml -}}
 {{- $image := $componentSection.image | default dict -}}
 {{- $image = mustMerge $image .ctx.Values.image -}}
-{{ $image.repository }}:{{ $image.tag | default .ctx.Chart.AppVersion }}
+{{- $tag := $image.tag -}}
+{{- /* xScaler: the engine image of this fork carries an -xs.<n> tag that differs from appVersion. */ -}}
+{{- $xscaler := .ctx.Values.xscaler | default dict -}}
+{{- if and (not $tag) $xscaler.engineTag (or (eq $image.repository (printf "%s/xscaler/mimir" ($xscaler.engineRegistry | default "ghcr.io"))) (hasSuffix "/xscaler/mimir" $image.repository)) -}}
+{{- $tag = $xscaler.engineTag -}}
+{{- end -}}
+{{ $image.repository }}:{{ $tag | default .ctx.Chart.AppVersion }}
 {{- end -}}
 
 {{/*
