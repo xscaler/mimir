@@ -370,11 +370,44 @@ jobs:
           echo "Running unit tests (group ${TEST_GROUP_ID} of ${TEST_GROUP_TOTAL}) with build tags: ${EXTRA_BUILD_TAGS:-none} with Go version: $(go version)"
           ./.github/workflows/scripts/run-unit-tests-group.sh --index "${TEST_GROUP_ID}" --total "${TEST_GROUP_TOTAL}"
 
+  # Mirrors upstream's test-docs.yml. That workflow checks out the release-<x.y> branch
+  # of the repository for the versioned docs, which does not exist in this fork, so the
+  # same steps run here against the checked out tree.
   test-docs:
     needs: prepare
-    uses: ./.github/workflows/test-docs.yml
-    permissions:
-      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Build website to test Mimir documentation
+        run: |
+          set -x
+          docker run \
+            -v "${PWD}/docs/sources/mimir:/hugo/content/docs/mimir/latest" \
+            -e HUGO_REFLINKSERRORLEVEL=ERROR \
+            --rm \
+            grafana/docs-base@sha256:b4d886449a18b7b7532214b58ed08332cc76b9469924cb08bc0c71fe161dc950 \
+            /bin/bash -c 'make hugo'
+      - name: Determine Mimir version targeted by Helm chart documentation
+        id: mimir_version
+        run: |
+          MIMIR_VERSION=$(sed -ne '/^---$/,/^---$/{ s/^ *MIMIR_VERSION: "\([^"]\{1,\}\)"/\1/p; }' docs/sources/helm-charts/mimir-distributed/_index.md)
+          echo "version=${MIMIR_VERSION}" | tee "${GITHUB_OUTPUT}"
+      - name: Build website to test Helm chart documentation
+        env:
+          MIMIR_VERSION: ${{ steps.mimir_version.outputs.version }}
+        run: |
+          set -x
+          docker run \
+            -v "${GITHUB_WORKSPACE}/docs/sources/mimir:/hugo/content/docs/mimir/${MIMIR_VERSION}" \
+            -v "${PWD}/docs/sources/helm-charts/mimir-distributed:/hugo/content/docs/helm-charts/mimir-distributed/latest" \
+            -e HUGO_REFLINKSERRORLEVEL=ERROR \
+            --rm \
+            grafana/docs-base@sha256:b4d886449a18b7b7532214b58ed08332cc76b9469924cb08bc0c71fe161dc950 \
+            /bin/bash -c 'make hugo'
 
   build-mimirtool-image:
     runs-on: ubuntu-latest

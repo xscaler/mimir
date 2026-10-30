@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Shared helpers for the xs-* publish jobs. Source this file, do not execute it.
 # Needs crane and cosign on PATH for the functions that use them.
 
