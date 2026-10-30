@@ -150,3 +150,30 @@ xs_sign() {
     --certificate-oidc-issuer "${XS_OIDC_ISSUER}" "${ref}" > /dev/null
   echo "signed and verified: ${ref}"
 }
+
+# xs_verify_trusted REPO DIGEST IDENTITY COMMIT [attest-repo]: decide whether an image found in the
+# registry may be reused. It must carry the requested commit in its revision label, a valid cosign
+# signature from the exact IDENTITY, and a valid provenance attestation from that identity. Only
+# verifies: it never signs or attests. Prints "exists without trusted provenance" and returns 1
+# otherwise.
+xs_verify_trusted() {
+  local repo="$1" digest="$2" identity="$3" commit="$4" amd64 revision
+  _xs_untrusted() {
+    echo "::error::tag exists without trusted provenance (${1}): investigate, then bump -xs.n"
+    return 1
+  }
+  # shellcheck disable=SC2086
+  amd64="$(crane manifest ${XS_CRANE_FLAGS:-} "${repo}@${digest}" | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest')" ||
+    { _xs_untrusted "cannot read the manifest"; return 1; }
+  # shellcheck disable=SC2086
+  revision="$(crane config ${XS_CRANE_FLAGS:-} "${repo}@${amd64}" | jq -r '.config.Labels["org.opencontainers.image.revision"]')" ||
+    { _xs_untrusted "cannot read the image config"; return 1; }
+  if [ "${revision}" != "${commit}" ]; then
+    _xs_untrusted "revision label ${revision} is not ${commit}"
+    return 1
+  fi
+  cosign verify --certificate-identity "${identity}" --certificate-oidc-issuer "${XS_OIDC_ISSUER}" \
+    "${repo}@${digest}" > /dev/null 2>&1 || { _xs_untrusted "no valid signature from ${identity}"; return 1; }
+  gh attestation verify "oci://${repo}@${digest}" --repo xscaler/mimir --cert-identity "${identity}" \
+    > /dev/null 2>&1 || { _xs_untrusted "no valid provenance attestation from ${identity}"; return 1; }
+}

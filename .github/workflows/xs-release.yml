@@ -253,22 +253,12 @@ jobs:
             *) exit 1 ;;
           esac
           echo "${IMAGE_REPO}:${IMAGE_TAG} exists at ${existing}, checking that it can be trusted."
-          untrusted() {
-            echo "::error::tag exists without trusted provenance (${1}): investigate, then bump -xs.n"
-            exit 1
-          }
-          cosign verify --certificate-identity "${IDENTITY}" --certificate-oidc-issuer "${XS_OIDC_ISSUER}" \
-            "${IMAGE_REPO}@${existing}" > /dev/null || untrusted "no valid signature from ${IDENTITY}"
-          gh attestation verify "oci://${IMAGE_REPO}@${existing}" --repo xscaler/mimir --cert-identity "${IDENTITY}" \
-            > /dev/null || untrusted "no valid provenance attestation from ${IDENTITY}"
-          amd64="$(crane manifest "${IMAGE_REPO}@${existing}" | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest')"
-          revision="$(crane config "${IMAGE_REPO}@${amd64}" | jq -r '.config.Labels["org.opencontainers.image.revision"]')"
-          [ "${revision}" = "${COMMIT}" ] || untrusted "revision label ${revision} is not ${COMMIT}"
+          xs_verify_trusted "${IMAGE_REPO}" "${existing}" "${IDENTITY}" "${COMMIT}"
           echo "existing_digest=${existing}" >> "${GITHUB_OUTPUT}"
 
   binaries:
     needs: [prepare, registry-check]
-    if: always() && needs.prepare.result == 'success' && !failure() && !cancelled() && needs.registry-check.outputs.existing_digest == ''
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.registry-check.result != 'failure' && needs.registry-check.outputs.existing_digest == '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -492,10 +482,48 @@ jobs:
           [ "${rc}" -eq 1 ]
           docker run --rm --platform linux/amd64 "127.0.0.1:5000/xscaler/mimir@${AMD64}" -version
           echo "dry run ok: ${DIGEST}"
+      - name: Negative trust tests (unsigned image, wrong revision)
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          IDENTITY: https://github.com/xscaler/mimir/.github/workflows/xs-release.yml@refs/heads/main
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_cosign
+          repo=127.0.0.1:5000/xscaler/mimir
+          # Record every cosign and gh invocation to prove nothing is signed or attested.
+          shim="${RUNNER_TEMP}/shim"
+          mkdir -p "${shim}"
+          real_cosign="$(command -v cosign)"
+          printf '#!/usr/bin/env bash\necho "cosign $*" >> "%s/calls.log"\nexec "%s" "$@"\n' "${RUNNER_TEMP}" "${real_cosign}" > "${shim}/cosign"
+          chmod +x "${shim}/cosign"
+          : > "${RUNNER_TEMP}/calls.log"
+          export PATH="${shim}:${PATH}"
+
+          # An unsigned image with the right revision label is rejected at the signature check.
+          out="$(xs_verify_trusted "${repo}" "${DIGEST}" "${IDENTITY}" "${COMMIT}" 2>&1)" && { echo "::error::unsigned image was accepted"; exit 1; }
+          grep -q 'exists without trusted provenance (no valid signature' <<< "${out}"
+          # A wrong revision label is rejected before anything else.
+          out="$(xs_verify_trusted "${repo}" "${DIGEST}" "${IDENTITY}" 0000000000000000000000000000000000000000 2>&1)" && { echo "::error::wrong revision was accepted"; exit 1; }
+          grep -q 'exists without trusted provenance (revision label' <<< "${out}"
+
+          if grep -Eq 'cosign (sign|attest)' "${RUNNER_TEMP}/calls.log"; then
+            echo "::error::a sign or attest call was made"
+            exit 1
+          fi
+          # Nothing was written to GHCR: no login, no credentials, no OIDC token in this job.
+          if [ -f "${HOME}/.docker/config.json" ] && grep -q 'ghcr.io' "${HOME}/.docker/config.json"; then
+            echo "::error::GHCR credentials are present in the dry run job"
+            exit 1
+          fi
+          echo "negative trust tests ok"
 
   publish:
     needs: [prepare, registry-check, image]
-    if: always() && !failure() && !cancelled() && (needs.prepare.outputs.mode == 'release' || needs.prepare.outputs.mode == 'rehearsal')
+    # Runs on the reuse path too, where binaries and image are skipped.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.registry-check.result == 'success' && (needs.image.result == 'success' || needs.image.result == 'skipped') && (needs.prepare.outputs.mode == 'release' || needs.prepare.outputs.mode == 'rehearsal') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: ${{ needs.prepare.outputs.mode == 'release' && 'release' || 'rehearsal' }}
@@ -600,7 +628,8 @@ jobs:
 
   verify:
     needs: [prepare, publish]
-    if: always() && !failure() && !cancelled() && needs.publish.result == 'success'
+    # Runs on the reuse path too, where build is skipped, hence the explicit result check.
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     strategy:
@@ -683,7 +712,8 @@ jobs:
   tag:
     # The git tag is created only after the image is published and verified.
     needs: [prepare, verify]
-    if: needs.prepare.outputs.mode == 'release'
+    # Runs on the reuse path too, where build and publish steps are skipped, hence the explicit result check.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && needs.prepare.outputs.mode == 'release' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
