@@ -1,9 +1,21 @@
-# Lint, render and publish the mimir-distributed Helm chart.
+# Lint, render, test and publish the mimir-distributed Helm chart.
 #
-# Pull requests and pushes to main run the lint and render checks. Pushes to
-# main then publish the chart to GHCR and ECR when a chart version ending in
-# +xs.<n> is not in the registry yet. Upstream weekly and release chart
-# versions are never published from here.
+# The chart is an import of the upstream release chart, not the weekly chart
+# that main carries upstream. To move to a new upstream chart release
+# (mimir-distributed-<x.y.z>, whose appVersion matches the engine version in
+# VERSION), check out these paths from that upstream tag:
+#   operations/helm
+#   operations/mimir-mixin-compiled
+#   operations/mimir-mixin-compiled-baremetal
+#   docs/sources/helm-charts
+# commit that as the import, then re-apply the xScaler image patch: default
+# image.repository ghcr.io/xscaler/mimir, image.tag <appVersion>-xs.<n>,
+# chart version <version>+xs.<n>, and run `make build-helm-tests` to
+# regenerate the golden records.
+#
+# Pull requests and pushes to main and ci/** run the checks. Pushes to main
+# publish the chart to GHCR when a +xs.<n> chart version is not in the
+# registry yet. Upstream weekly and release chart versions are never published.
 name: xs-charts
 
 on:
@@ -13,12 +25,18 @@ on:
       - 'ci/**'
     paths:
       - 'operations/helm/**'
+      - 'operations/mimir-mixin-compiled/**'
+      - 'operations/mimir-mixin-compiled-baremetal/**'
+      - 'docs/sources/helm-charts/**'
       - '.github/workflows/xs-charts.yml'
   pull_request:
     branches:
       - main
     paths:
       - 'operations/helm/**'
+      - 'operations/mimir-mixin-compiled/**'
+      - 'operations/mimir-mixin-compiled-baremetal/**'
+      - 'docs/sources/helm-charts/**'
       - '.github/workflows/xs-charts.yml'
   workflow_dispatch:
 
@@ -47,6 +65,8 @@ jobs:
     outputs:
       version: ${{ steps.chart.outputs.version }}
       publish: ${{ steps.chart.outputs.publish }}
+      engine_image: ${{ steps.engine.outputs.image }}
+      build_image: ${{ steps.engine.outputs.build_image }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -85,6 +105,23 @@ jobs:
             echo "helm lint with ${f}"
             helm lint "${CHART_DIR}" -f "${f}"
           done
+      - name: Assert the engine image tag starts with appVersion
+        id: engine
+        run: |
+          set -euo pipefail
+          app="$(sed -n 's/^appVersion: *//p' "${CHART_DIR}/Chart.yaml" | head -n 1 | tr -d '"')"
+          images="$(helm template ci "${CHART_DIR}" | sed -n 's#^ *\(- \)\{0,1\}image: *"\{0,1\}\(ghcr.io/xscaler/mimir:[^" ]*\).*#\2#p' | sort -u)"
+          echo "engine images: ${images}"
+          if [ "$(printf '%s\n' "${images}" | grep -c .)" -ne 1 ]; then
+            echo "::error::expected exactly one engine image in the rendered chart"
+            exit 1
+          fi
+          case "${images#ghcr.io/xscaler/mimir:}" in
+            "${app}"*) ;;
+            *) echo "::error::engine tag ${images} does not start with appVersion ${app}"; exit 1 ;;
+          esac
+          echo "image=${images}" >> "${GITHUB_OUTPUT}"
+          echo "build_image=$(make print-build-image)" >> "${GITHUB_OUTPUT}"
       - name: ct lint
         run: ct lint --config operations/helm/ct.yaml --charts "${CHART_DIR}" --check-version-increment=false
       - name: helm template against the CI values
@@ -96,8 +133,31 @@ jobs:
             helm template ci "${CHART_DIR}" -f "${f}" > /dev/null
           done
 
-  publish-ghcr:
+  golden:
+    # Upstream's chart tests: golden records and conftest policies.
     needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.verify.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the verify job is pinned
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run Git Config
+        run: git config --global --add safe.directory '*'
+      - name: Symlink Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/grafana/mimir
+          ln -s "$GITHUB_WORKSPACE"/* /go/src/github.com/grafana/mimir
+      - name: Check Helm Tests
+        run: make BUILD_IN_CONTAINER=false check-helm-tests
+
+  publish-ghcr:
+    needs: [verify, golden]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.verify.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -136,6 +196,12 @@ jobs:
           set -euo pipefail
           . .github/scripts/xs-lib.sh
           xs_install_crane
+      - name: Check the engine image exists
+        env:
+          ENGINE_IMAGE: ${{ needs.verify.outputs.engine_image }}
+        run: |
+          set -euo pipefail
+          crane manifest "${ENGINE_IMAGE}" > /dev/null || { echo "::error::engine image ${ENGINE_IMAGE} is not published, release the image before the chart"; exit 1; }
       - name: Package chart and push to GHCR unless the version exists
         id: ghcr
         run: |
