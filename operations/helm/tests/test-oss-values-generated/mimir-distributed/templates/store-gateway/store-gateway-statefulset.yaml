@@ -71,6 +71,7 @@ spec:
           emptyDir: {}
       containers:
         - name: store-gateway
+          image: ghcr.io/xscaler/mimir:3.2.3-xs.0
           imagePullPolicy: IfNotPresent
           args:
             - "-target=store-gateway"

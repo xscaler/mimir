@@ -108,6 +108,7 @@ spec:
           emptyDir: {}
       containers:
         - name: ingester
+          image: ghcr.io/xscaler/mimir:3.2.3-xs.0
           imagePullPolicy: IfNotPresent
           args:
             - "-target=ingester"
@@ -266,6 +267,7 @@ spec:
           emptyDir: {}
       containers:
         - name: ingester
+          image: ghcr.io/xscaler/mimir:3.2.3-xs.0
           imagePullPolicy: IfNotPresent
           args:
             - "-target=ingester"
@@ -424,6 +426,7 @@ spec:
           emptyDir: {}
       containers:
         - name: ingester
+          image: ghcr.io/xscaler/mimir:3.2.3-xs.0
           imagePullPolicy: IfNotPresent
           args:
             - "-target=ingester"

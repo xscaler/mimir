@@ -29,10 +29,11 @@ fullnameOverride: null
 
 image:
   # -- Grafana Mimir container image repository
-  repository: docker.io/grafana/mimir
+  repository: ghcr.io/xscaler/mimir
   # -- Grafana Mimir container image tag
   # When set it takes precedence over what is defined as "appVersion" in Chart.yaml.
-  # tag: 3.2.0
+  # The xScaler build of the engine reports appVersion with an -xs.<n> suffix.
+  tag: 3.2.3-xs.0
   # -- Container pull policy
   pullPolicy: IfNotPresent
   # -- Optionally specify an array of imagePullSecrets
