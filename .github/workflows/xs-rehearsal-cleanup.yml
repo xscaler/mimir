@@ -45,8 +45,12 @@ jobs:
               [ -n "${id}" ] || continue
               # ISO 8601 timestamps in UTC compare correctly as strings.
               if [[ "${created}" < "${cutoff}" ]]; then
-                gh api -X DELETE "orgs/xscaler/packages/container/${pkg}/versions/${id}"
-                deleted=$((deleted + 1))
+                # One version failing to delete must not stop the rest.
+                if gh api -X DELETE "orgs/xscaler/packages/container/${pkg}/versions/${id}" > /dev/null; then
+                  deleted=$((deleted + 1))
+                else
+                  echo "::warning::could not delete ${pkg} version ${id}, continuing"
+                fi
               fi
             done <<< "${out}"
             echo "${pkg}: deleted ${deleted} versions older than ${cutoff}."

@@ -191,6 +191,13 @@ jobs:
           ln -s "$GITHUB_WORKSPACE"/* /go/src/github.com/grafana/mimir
       - name: Check Helm Tests
         run: make BUILD_IN_CONTAINER=false check-helm-tests
+      # Mirror of the conftest job of upstream's helm-ci.yml.
+      - name: Lint Rego Policies
+        run: make BUILD_IN_CONTAINER=false check-conftest-fmt
+      - name: Run conftest policy unit tests
+        env:
+          TEMP_DIR: ${{ runner.temp }}/conftest
+        run: make BUILD_IN_CONTAINER=false conftest-verify
 
   publish:
     needs: [verify, golden]

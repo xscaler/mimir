@@ -29,8 +29,7 @@ name: xs-release
 on:
   push:
     branches:
-      - main
-      - 'ci/**'
+      - '**'
     tags:
       - 'v*-xs.*'
   pull_request:
@@ -50,8 +49,8 @@ on:
 permissions: {}
 
 concurrency:
-  # Release runs share one group so bursts queue instead of replacing each other.
-  group: ${{ github.event_name == 'workflow_dispatch' && 'xs-release-publish' || format('xs-release-{0}-{1}', github.event_name, github.ref) }}
+  # One group per tag for releases, so reruns and bursts for the same tag queue instead of racing.
+  group: xs-release-${{ inputs.tag || format('{0}-{1}', github.event_name, github.ref) }}
   cancel-in-progress: false
 
 jobs:

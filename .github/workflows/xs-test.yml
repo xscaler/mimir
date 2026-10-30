@@ -6,6 +6,13 @@
 #   - deploy (pushes to Grafana's GAR), release (publishes a grafana/mimir
 #     GitHub release) and the Slack notifications: Grafana-only secrets/infra.
 #   - notify-streamingpromql-failures: PR comment bot for Grafana's vendoring flow.
+#   - upstream's other workflows: flaky-tests (Grafana vault and Loki secrets), codeql (static
+#     analysis, not a test suite), compare-helm-with-jsonnet (checks the weekly chart against the
+#     jsonnet of the same commit, which cannot match the imported 6.2.2 release chart), helm-ci
+#     call-lint and call-lint-test (grafana/helm-charts reusable workflows and a kind install
+#     test; xs-charts runs ct lint instead) and the helm-ci conftest job (run in xs-charts).
+#     The nested go modules (mimir-build-image, mixin screenshots) have no tests, and upstream
+#     has no govulncheck job; Trivy covers the shipped binary in xs-release.
 #   - build-metaconvert/query-tee/copyblocks images, build-dist and
 #     build-packages: artifacts we do not ship. The mimir image is built and
 #     scanned by xs-release.yml, mimirtool is built here for integration tests.
@@ -17,8 +24,7 @@ on:
       - main
   push:
     branches:
-      - main
-      - 'ci/**'
+      - '**'
   workflow_dispatch:
   schedule:
     - cron: '17 4 * * 1'
