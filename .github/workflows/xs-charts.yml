@@ -67,6 +67,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       oci_tag: ${{ steps.meta.outputs.oci_tag }}
       charts_repo: ${{ steps.meta.outputs.charts_repo }}
+      package: ${{ steps.meta.outputs.package }}
       identity: ${{ steps.meta.outputs.identity }}
       engine_image: ${{ steps.engine.outputs.image }}
       build_image: ${{ steps.engine.outputs.build_image }}
@@ -102,6 +103,7 @@ jobs:
           fi
           mode=verify
           charts_repo=ghcr.io/xscaler/charts
+          package="charts/${CHART_NAME}"
           if [[ "${EVENT_NAME}" == "push" && "${REF}" == "refs/heads/main" ]]; then
             mode=release
           elif [[ "${EVENT_NAME}" == "push" && "${REF}" == refs/heads/ci/* ]]; then
@@ -109,6 +111,7 @@ jobs:
             short="$(git rev-parse --short=12 "${WORKFLOW_SHA}")"
             version="${version%%+*}+rehearsal.${short}"
             charts_repo=ghcr.io/xscaler/rehearsal/charts
+            package="rehearsal/charts/${CHART_NAME}"
           fi
           {
             echo "mode=${mode}"
@@ -116,6 +119,7 @@ jobs:
             # Helm stores the + of SemVer build metadata as _ in OCI tags.
             echo "oci_tag=${version//+/_}"
             echo "charts_repo=${charts_repo}"
+            echo "package=${package}"
             echo "identity=https://github.com/${WORKFLOW_REF}"
           } >> "${GITHUB_OUTPUT}"
       - name: Add chart repositories and build dependencies
@@ -204,7 +208,9 @@ jobs:
       VERSION: ${{ needs.verify.outputs.version }}
       OCI_TAG: ${{ needs.verify.outputs.oci_tag }}
       CHARTS_REPO: ${{ needs.verify.outputs.charts_repo }}
+      PACKAGE: ${{ needs.verify.outputs.package }}
       IDENTITY: ${{ needs.verify.outputs.identity }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       ENGINE_IMAGE: ${{ needs.verify.outputs.engine_image }}
     outputs:
       digest: ${{ steps.push.outputs.digest }}
@@ -250,10 +256,21 @@ jobs:
           . .github/scripts/xs-lib.sh
           ref="${CHARTS_REPO}/${CHART_NAME}"
           rc=0
-          existing="$(xs_digest "${ref}:${OCI_TAG}")" || rc=$?
+          existing="$(xs_tag_digest "${PACKAGE}" "${ref}:${OCI_TAG}")" || rc=$?
           case "${rc}" in
             0)
-              echo "Chart ${CHART_NAME} ${VERSION} already in GHCR at ${existing}, comparing rendered output."
+              # Never trust or sign what is found in the registry: accept it only with a valid
+              # signature and provenance attestation from this workflow's identity and identical
+              # rendered content.
+              echo "Chart ${CHART_NAME} ${VERSION} already in GHCR at ${existing}, checking that it can be trusted."
+              untrusted() {
+                echo "::error::chart exists without trusted provenance (${1}): investigate, then bump the chart version"
+                exit 1
+              }
+              cosign verify --certificate-identity "${IDENTITY}" --certificate-oidc-issuer "${XS_OIDC_ISSUER}" \
+                "${ref}@${existing}" > /dev/null || untrusted "no valid signature from ${IDENTITY}"
+              gh attestation verify "oci://${ref}@${existing}" --repo xscaler/mimir --cert-identity "${IDENTITY}" \
+                > /dev/null || untrusted "no valid provenance attestation from ${IDENTITY}"
               helm pull "oci://${ref}" --version "${VERSION}" --untar --untardir "${RUNNER_TEMP}/published"
               norm() { sed 's/mimir-distributed-[0-9][0-9A-Za-z._+-]*/CHART_LABEL/g; s#\(checksum/[a-z-]*:\) .*#\1 X#'; }
               for f in "" "${CHART_DIR}"/ci/*.yaml; do
@@ -262,36 +279,39 @@ jobs:
                 helm template rel "${CHART_DIR}" "${args[@]}" 2> /dev/null | norm > "${RUNNER_TEMP}/ours.yaml"
                 helm template rel "${RUNNER_TEMP}/published/${CHART_NAME}" "${args[@]}" 2> /dev/null | norm > "${RUNNER_TEMP}/theirs.yaml"
                 if ! diff -q "${RUNNER_TEMP}/ours.yaml" "${RUNNER_TEMP}/theirs.yaml" > /dev/null; then
-                  echo "::error::published chart ${VERSION} renders differently from this commit (values ${f:-default}); bump the chart version"
                   diff "${RUNNER_TEMP}/ours.yaml" "${RUNNER_TEMP}/theirs.yaml" | head -20
-                  exit 1
+                  untrusted "renders differently from this commit (values ${f:-default})"
                 fi
               done
               echo "digest=${existing}" >> "${GITHUB_OUTPUT}"
+              echo "pushed=false" >> "${GITHUB_OUTPUT}"
               ;;
             1)
               helm push "${RUNNER_TEMP}/pkg/${CHART_NAME}-${VERSION}.tgz" "oci://${CHARTS_REPO}" 2>&1 | tee "${RUNNER_TEMP}/push.log"
               digest="$(sed -n 's/^Digest: *//p' "${RUNNER_TEMP}/push.log" | tail -n 1)"
               [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
               echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+              echo "pushed=true" >> "${GITHUB_OUTPUT}"
               ;;
             *)
               exit 1
               ;;
           esac
       - name: Attest build provenance
+        if: steps.push.outputs.pushed == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.CHARTS_REPO }}/${{ env.CHART_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
-      - name: Ensure the chart is signed
+      - name: Sign the chart pushed by this run
+        if: steps.push.outputs.pushed == 'true'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           set -euo pipefail
           . .github/scripts/xs-lib.sh
-          xs_ensure_signed "${CHARTS_REPO}/${CHART_NAME}@${DIGEST}" "${IDENTITY}"
+          xs_sign "${CHARTS_REPO}/${CHART_NAME}@${DIGEST}" "${IDENTITY}"
 
   verify-published:
     needs: [verify, publish]
@@ -335,7 +355,7 @@ jobs:
           cosign verify --certificate-identity "${IDENTITY}" \
             --certificate-oidc-issuer "${XS_OIDC_ISSUER}" "${CHARTS_REPO}/${CHART_NAME}@${DIGEST}" > /dev/null
           gh attestation verify "oci://${CHARTS_REPO}/${CHART_NAME}@${DIGEST}" --repo xscaler/mimir \
-            --signer-workflow xscaler/mimir/.github/workflows/xs-charts.yml
+            --cert-identity "${IDENTITY}"
       - name: Pull the chart and check its version
         run: |
           set -euo pipefail

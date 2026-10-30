@@ -79,48 +79,65 @@ xs_install_helm() {
   rm -f "${tgz}"
 }
 
-# xs_digest REF: prints the manifest digest of REF.
-# Return 0: present. Return 1: absent, which means the registry answered MANIFEST_UNKNOWN or
-# NAME_UNKNOWN, or GHCR's documented answer for a package that does not exist yet (the pull token
-# request is DENIED). Return 2: any other failure (network, auth, server error).
-xs_digest() {
-  local out rc
+# xs_package_exists NAME: NAME is the container package name, for example mimir or
+# rehearsal/mimir. Asks the GitHub Packages API, which needs GH_TOKEN. Return 0: exists. Return 1:
+# the API answered 404, so the package does not exist yet and no tag can exist either. Return 2:
+# any other failure.
+xs_package_exists() {
+  local name="${1//\//%2F}" out rc
   set +e
-  out="$(crane digest "$1" 2>&1)"
+  out="$(gh api "orgs/xscaler/packages/container/${name}" 2>&1)"
   rc=$?
   set -e
   if [ "${rc}" -eq 0 ]; then
-    printf '%s\n' "${out}"
     return 0
   fi
-  if printf '%s' "${out}" | grep -Eq 'MANIFEST_UNKNOWN|NAME_UNKNOWN|ghcr\.io/token\?scope=[^ ]*: DENIED'; then
+  if printf '%s' "${out}" | grep -q 'HTTP 404'; then
     return 1
   fi
   printf '%s\n' "${out}" >&2
   return 2
 }
 
-# xs_ensure_signed REF IDENTITY [sign flags...]: REF is repo@digest, IDENTITY the exact certificate
-# identity this run signs with. Verify first. Only "no signatures found" means unsigned: sign, then
-# verify again. Every other failure, including a signature from a different identity, fails.
-xs_ensure_signed() {
-  local ref="$1" identity="$2" out rc
-  shift 2
+# xs_digest REF: prints the manifest digest of REF (crane, honouring XS_CRANE_FLAGS).
+# Return 0: present. Return 1: absent, which means the registry answered MANIFEST_UNKNOWN or
+# NAME_UNKNOWN. Return 2: any other failure (network, auth, server error). Call xs_package_exists
+# first for GHCR, which does not answer NAME_UNKNOWN for a package that does not exist yet.
+xs_digest() {
+  local out rc
   set +e
-  out="$(cosign verify --certificate-identity "${identity}" \
-    --certificate-oidc-issuer "${XS_OIDC_ISSUER}" "${ref}" 2>&1)"
+  # shellcheck disable=SC2086
+  out="$(crane digest ${XS_CRANE_FLAGS:-} "$1" 2>&1)"
   rc=$?
   set -e
   if [ "${rc}" -eq 0 ]; then
-    echo "already signed: ${ref}"
+    printf '%s\n' "${out}"
     return 0
   fi
-  if ! printf '%s' "${out}" | grep -q 'no signatures found'; then
-    printf '%s\n' "${out}" >&2
-    echo "::error::cosign verify failed for ${ref}"
+  if printf '%s' "${out}" | grep -Eq 'MANIFEST_UNKNOWN|NAME_UNKNOWN'; then
     return 1
   fi
-  echo "no signature on ${ref}, signing"
+  printf '%s\n' "${out}" >&2
+  return 2
+}
+
+# xs_tag_digest PACKAGE REF: like xs_digest, but checks the package first. A package that does not
+# exist yet means the tag is absent.
+xs_tag_digest() {
+  local rc=0
+  xs_package_exists "$1" || rc=$?
+  case "${rc}" in
+    0) xs_digest "$2" ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# xs_sign REF IDENTITY [sign flags...]: sign an artifact this run built, then verify the signature
+# with the exact identity. Never call this for a digest that was found in the registry.
+xs_sign() {
+  local ref="$1" identity="$2"
+  shift 2
   cosign sign --yes "$@" "${ref}"
   cosign verify --certificate-identity "${identity}" \
     --certificate-oidc-issuer "${XS_OIDC_ISSUER}" "${ref}" > /dev/null

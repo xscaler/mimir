@@ -1,12 +1,24 @@
 # Build, scan, sign and publish the xScaler Mimir image to GHCR.
 #
+# To release, dispatch this workflow on main (a tag push only runs verify mode):
+#   gh workflow run xs-release.yml --ref main -f tag=v<version>-xs.<n> -f commit=<sha>
+# The commit must be an ancestor of main and descend from the upstream release tag mimir-<version>.
+# The git tag is created after the image is published and verified. xs-weekly.yml dispatches
+# rebuilds the same way.
+#
 # Modes, chosen in the prepare job:
-#   release    tag push v<version>-xs.<n>, or workflow_dispatch on main with a tag (and a commit
-#              when the tag does not exist yet). Publishes ghcr.io/xscaler/mimir:<version> and
-#              creates the git tag after the image is verified. The commit must be an ancestor of main.
+#   release    workflow_dispatch on refs/heads/main. Publishes ghcr.io/xscaler/mimir:<version> and
+#              signs with the identity
+#              https://github.com/xscaler/mimir/.github/workflows/xs-release.yml@refs/heads/main
 #   rehearsal  push to ci/**. Runs the same publish path against
 #              ghcr.io/xscaler/rehearsal/mimir:<shortsha>. Never touches ghcr.io/xscaler/mimir.
-#   verify     push to main and pull requests. Builds both arches and scans, pushes nothing.
+#   verify     everything else (pushes to main, tag pushes, pull requests). Builds both arches,
+#              scans, and dry-runs the push and index logic against a local registry.
+#
+# GHCR tags are mutable and any workflow run in the repository can write them, so nothing found in
+# the registry is trusted: an existing release tag is accepted only with a valid signature and
+# provenance attestation from the release identity and the requested commit in its revision label.
+# Otherwise the run fails and the -xs.<n> number has to be bumped.
 #
 # The binaries are built with upstream's make target inside upstream's build image. The per-arch
 # images are built from upstream's cmd/mimir/Dockerfile with the buildx arguments of the
@@ -31,14 +43,15 @@ on:
         required: true
         type: string
       commit:
-        description: 'Commit to release, required when the tag does not exist yet'
-        required: false
+        description: 'Full SHA of the commit to release'
+        required: true
         type: string
 
 permissions: {}
 
 concurrency:
-  group: xs-release-${{ inputs.tag || github.ref_name }}
+  # Release runs share one group so bursts queue instead of replacing each other.
+  group: ${{ github.event_name == 'workflow_dispatch' && 'xs-release-publish' || format('xs-release-{0}-{1}', github.event_name, github.ref) }}
   cancel-in-progress: false
 
 jobs:
@@ -56,6 +69,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       image_repo: ${{ steps.meta.outputs.image_repo }}
       image_tag: ${{ steps.meta.outputs.image_tag }}
+      package: ${{ steps.meta.outputs.package }}
       identity: ${{ steps.meta.outputs.identity }}
       build_image: ${{ steps.meta.outputs.build_image }}
     steps:
@@ -70,17 +84,17 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           REF: ${{ github.ref }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_COMMIT: ${{ inputs.commit }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           WORKFLOW_SHA: ${{ github.sha }}
           IMAGE_ROOT: ghcr.io/xscaler
+          RELEASE_IDENTITY: https://github.com/xscaler/mimir/.github/workflows/xs-release.yml@refs/heads/main
         run: |
           set -euo pipefail
+          export LC_ALL=C
           nl=$'\n'
-          for v in "${INPUT_TAG}" "${INPUT_COMMIT}" "${REF_NAME}"; do
+          for v in "${INPUT_TAG}" "${INPUT_COMMIT}"; do
             if [[ "${v}" == *"${nl}"* ]]; then
               echo "::error::input contains a newline"
               exit 1
@@ -97,9 +111,6 @@ jobs:
             fi
             mode=release
             tag="${INPUT_TAG}"
-          elif [[ "${EVENT_NAME}" == "push" && "${REF_TYPE}" == "tag" ]]; then
-            mode=release
-            tag="${REF_NAME}"
           elif [[ "${EVENT_NAME}" == "push" && "${REF}" == refs/heads/ci/* ]]; then
             mode=rehearsal
           fi
@@ -109,25 +120,25 @@ jobs:
           version="${upstream_version}-xs.0"
           image_repo="${IMAGE_ROOT}/mimir"
           image_tag="${version}"
+          package=mimir
+          identity="https://github.com/${WORKFLOW_REF}"
 
           if [[ "${mode}" == "release" ]]; then
             if [[ ! "${tag}" =~ ${tag_re} ]]; then
               echo "::error::tag does not match v<upstream-version>-xs.<n>"
               exit 1
             fi
+            if [[ ! "${INPUT_COMMIT}" =~ ${sha_re} ]]; then
+              echo "::error::a full 40 character commit is required"
+              exit 1
+            fi
+            git cat-file -e "${INPUT_COMMIT}^{commit}"
+            commit="${INPUT_COMMIT}"
             if git rev-parse -q --verify "refs/tags/${tag}^{commit}" > /dev/null; then
-              commit="$(git rev-parse "refs/tags/${tag}^{commit}")"
-              if [[ -n "${INPUT_COMMIT}" && "${INPUT_COMMIT}" != "${commit}" ]]; then
+              if [[ "$(git rev-parse "refs/tags/${tag}^{commit}")" != "${commit}" ]]; then
                 echo "::error::tag ${tag} exists at a different commit than the commit input"
                 exit 1
               fi
-            else
-              if [[ ! "${INPUT_COMMIT}" =~ ${sha_re} ]]; then
-                echo "::error::tag ${tag} does not exist, a full 40 character commit input is required"
-                exit 1
-              fi
-              git cat-file -e "${INPUT_COMMIT}^{commit}"
-              commit="${INPUT_COMMIT}"
             fi
             # A release must come from main.
             if ! git merge-base --is-ancestor "${commit}" refs/remotes/origin/main; then
@@ -135,17 +146,42 @@ jobs:
               exit 1
             fi
             version="${tag#v}"
-            commit_version="$(git show "${commit}:VERSION")"
-            if [[ "${version%-xs.*}" != "${commit_version}" ]]; then
-              echo "::error::tag version ${version} does not match VERSION ${commit_version} at the commit"
+            u="${version%-xs.*}"
+            if [[ "$(git show "${commit}:VERSION")" != "${u}" ]]; then
+              echo "::error::tag version ${version} does not match VERSION at the commit"
               exit 1
             fi
+            # The upstream release tag must exist and be an ancestor of the commit, and no higher
+            # upstream release must be an ancestor of it.
+            if ! git rev-parse -q --verify "refs/tags/mimir-${u}^{commit}" > /dev/null; then
+              echo "::error::upstream release tag mimir-${u} does not exist"
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "refs/tags/mimir-${u}^{commit}" "${commit}"; then
+              echo "::error::upstream release tag mimir-${u} is not an ancestor of ${commit}"
+              exit 1
+            fi
+            while read -r other; do
+              [[ -n "${other}" ]] || continue
+              higher="$(printf '%s\n%s\n' "${u}" "${other#mimir-}" | sort -V | tail -n 1)"
+              if [[ "${higher}" != "${u}" ]] && git merge-base --is-ancestor "refs/tags/${other}^{commit}" "${commit}"; then
+                echo "::error::upstream release ${other} is newer than ${u} and is an ancestor of ${commit}"
+                exit 1
+              fi
+            done < <(git tag --list 'mimir-*' | { grep -E '^mimir-[0-9]+\.[0-9]+\.[0-9]+$' || [[ $? -eq 1 ]]; })
             image_tag="${version}"
+            # The only identity a release is accepted under.
+            identity="${RELEASE_IDENTITY}"
+            if [[ "https://github.com/${WORKFLOW_REF}" != "${identity}" ]]; then
+              echo "::error::unexpected workflow ref ${WORKFLOW_REF}"
+              exit 1
+            fi
           elif [[ "${mode}" == "rehearsal" ]]; then
             short="$(git rev-parse --short=12 "${WORKFLOW_SHA}")"
             version="${upstream_version}-xs.0-rehearsal.${short}"
             image_repo="${IMAGE_ROOT}/rehearsal/mimir"
             image_tag="${short}"
+            package=rehearsal/mimir
           fi
 
           git checkout -q --detach "${commit}"
@@ -157,12 +193,82 @@ jobs:
             echo "version=${version}"
             echo "image_repo=${image_repo}"
             echo "image_tag=${image_tag}"
-            echo "identity=https://github.com/${WORKFLOW_REF}"
+            echo "package=${package}"
+            echo "identity=${identity}"
             echo "build_image=${build_image}"
           } >> "${GITHUB_OUTPUT}"
 
-  binaries:
+  registry-check:
+    # Decides whether the release tag already exists, and whether it can be trusted.
     needs: prepare
+    if: needs.prepare.outputs.mode == 'release' || needs.prepare.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      IMAGE_REPO: ${{ needs.prepare.outputs.image_repo }}
+      IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
+      PACKAGE: ${{ needs.prepare.outputs.package }}
+      IDENTITY: ${{ needs.prepare.outputs.identity }}
+      COMMIT: ${{ needs.prepare.outputs.commit }}
+    outputs:
+      existing_digest: ${{ steps.check.outputs.existing_digest }}
+    steps:
+      - name: Check out CI scripts from the workflow commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install crane and cosign
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_crane
+          xs_install_cosign
+      - name: Look for an existing tag and verify it
+        id: check
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          rc=0
+          existing="$(xs_tag_digest "${PACKAGE}" "${IMAGE_REPO}:${IMAGE_TAG}")" || rc=$?
+          case "${rc}" in
+            1)
+              echo "${IMAGE_REPO}:${IMAGE_TAG} does not exist yet."
+              echo "existing_digest=" >> "${GITHUB_OUTPUT}"
+              exit 0
+              ;;
+            0) ;;
+            *) exit 1 ;;
+          esac
+          echo "${IMAGE_REPO}:${IMAGE_TAG} exists at ${existing}, checking that it can be trusted."
+          untrusted() {
+            echo "::error::tag exists without trusted provenance (${1}): investigate, then bump -xs.n"
+            exit 1
+          }
+          cosign verify --certificate-identity "${IDENTITY}" --certificate-oidc-issuer "${XS_OIDC_ISSUER}" \
+            "${IMAGE_REPO}@${existing}" > /dev/null || untrusted "no valid signature from ${IDENTITY}"
+          gh attestation verify "oci://${IMAGE_REPO}@${existing}" --repo xscaler/mimir --cert-identity "${IDENTITY}" \
+            > /dev/null || untrusted "no valid provenance attestation from ${IDENTITY}"
+          amd64="$(crane manifest "${IMAGE_REPO}@${existing}" | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest')"
+          revision="$(crane config "${IMAGE_REPO}@${amd64}" | jq -r '.config.Labels["org.opencontainers.image.revision"]')"
+          [ "${revision}" = "${COMMIT}" ] || untrusted "revision label ${revision} is not ${COMMIT}"
+          echo "existing_digest=${existing}" >> "${GITHUB_OUTPUT}"
+
+  binaries:
+    needs: [prepare, registry-check]
+    if: always() && needs.prepare.result == 'success' && !failure() && !cancelled() && needs.registry-check.outputs.existing_digest == ''
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -291,7 +397,6 @@ jobs:
               --severity CRITICAL --ignore-unfixed --exit-code 1
           done
       - name: Upload OCI archives
-        if: needs.prepare.outputs.mode != 'verify'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mimir-oci
@@ -304,7 +409,7 @@ jobs:
   sarif:
     # Separate job so the code that builds the image never holds security-events: write, and
     # pull requests never upload.
-    needs: [prepare, image]
+    needs: image
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -328,9 +433,69 @@ jobs:
           sarif_file: sarif/trivy-arm64.sarif
           category: trivy-mimir-arm64
 
-  publish:
+  dry-run:
+    # Runs the publish logic (push by digest, index creation, digest parsing) against a local
+    # registry in verify mode, so a pull request exercises it before a release does. Signing and
+    # attestations need OIDC and only run in publish.
     needs: [prepare, image]
-    if: needs.prepare.outputs.mode == 'release' || needs.prepare.outputs.mode == 'rehearsal'
+    if: needs.prepare.outputs.mode == 'verify'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    env:
+      XS_CRANE_FLAGS: --insecure
+    steps:
+      - name: Check out CI scripts from the workflow commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+      - name: Download OCI archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mimir-oci
+          path: ${{ runner.temp }}/oci
+      - name: Install crane
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_crane
+      - name: Push to the local registry
+        id: push
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          ./.github/scripts/xs-push-index.sh 127.0.0.1:5000/xscaler/mimir "${VERSION}" "${RUNNER_TEMP}/oci"
+      - name: Check the pushed index
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          AMD64: ${{ steps.push.outputs.amd64_digest }}
+          ARM64: ${{ steps.push.outputs.arm64_digest }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          got="$(xs_digest "127.0.0.1:5000/xscaler/mimir:${VERSION}")"
+          [ "${got}" = "${DIGEST}" ]
+          [ "${AMD64}" != "${ARM64}" ]
+          rc=0
+          xs_digest "127.0.0.1:5000/xscaler/mimir:does-not-exist" > /dev/null || rc=$?
+          [ "${rc}" -eq 1 ]
+          docker run --rm --platform linux/amd64 "127.0.0.1:5000/xscaler/mimir@${AMD64}" -version
+          echo "dry run ok: ${DIGEST}"
+
+  publish:
+    needs: [prepare, registry-check, image]
+    if: always() && !failure() && !cancelled() && (needs.prepare.outputs.mode == 'release' || needs.prepare.outputs.mode == 'rehearsal')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: ${{ needs.prepare.outputs.mode == 'release' && 'release' || 'rehearsal' }}
@@ -343,10 +508,11 @@ jobs:
       IMAGE_REPO: ${{ needs.prepare.outputs.image_repo }}
       IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
       IDENTITY: ${{ needs.prepare.outputs.identity }}
+      EXISTING: ${{ needs.registry-check.outputs.existing_digest }}
     outputs:
-      digest: ${{ steps.index.outputs.digest }}
-      amd64_digest: ${{ steps.index.outputs.amd64_digest }}
-      arm64_digest: ${{ steps.index.outputs.arm64_digest }}
+      digest: ${{ steps.index.outputs.digest || steps.existing.outputs.digest }}
+      amd64_digest: ${{ steps.index.outputs.amd64_digest || steps.existing.outputs.amd64_digest }}
+      arm64_digest: ${{ steps.index.outputs.arm64_digest || steps.existing.outputs.arm64_digest }}
     steps:
       - name: Check out CI scripts from the workflow commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -355,10 +521,11 @@ jobs:
           sparse-checkout: .github/scripts
           persist-credentials: false
       - name: Download OCI archives
+        if: env.EXISTING == ''
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: mimir-oci
-          path: ${{ runner.temp }}
+          path: ${{ runner.temp }}/oci
       - name: Log in to GHCR
         uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
@@ -374,54 +541,24 @@ jobs:
           xs_install_syft
       - name: Push the platform images and create the index
         id: index
+        if: env.EXISTING == ''
         run: |
           set -euo pipefail
-          . .github/scripts/xs-lib.sh
-          rc=0
-          existing="$(xs_digest "${IMAGE_REPO}:${IMAGE_TAG}")" || rc=$?
-          case "${rc}" in
-            0)
-              echo "${IMAGE_REPO}:${IMAGE_TAG} already exists at ${existing}, resuming with it."
-              index="${existing}"
-              ;;
-            1)
-              for arch in amd64 arm64; do
-                mkdir "${RUNNER_TEMP}/layout-${arch}"
-                tar -xf "${RUNNER_TEMP}/mimir-${arch}.tar" -C "${RUNNER_TEMP}/layout-${arch}"
-                d="$(jq -r '.manifests[0].digest' "${RUNNER_TEMP}/layout-${arch}/index.json")"
-                # Push by digest: no per-arch tags.
-                crane push "${RUNNER_TEMP}/layout-${arch}" "${IMAGE_REPO}@${d}"
-                got="$(xs_digest "${IMAGE_REPO}@${d}")"
-                [ "${got}" = "${d}" ]
-                echo "${arch}=${d}" >> "${RUNNER_TEMP}/arch-digests"
-              done
-              amd64="$(sed -n 's/^amd64=//p' "${RUNNER_TEMP}/arch-digests")"
-              arm64="$(sed -n 's/^arm64=//p' "${RUNNER_TEMP}/arch-digests")"
-              # Re-check right before creating the index: the tag must still be absent.
-              rc2=0
-              xs_digest "${IMAGE_REPO}:${IMAGE_TAG}" > /dev/null || rc2=$?
-              if [ "${rc2}" -ne 1 ]; then
-                echo "::error::${IMAGE_REPO}:${IMAGE_TAG} appeared while publishing, refusing to overwrite it"
-                exit 1
-              fi
-              docker buildx imagetools create --metadata-file "${RUNNER_TEMP}/index-metadata.json" \
-                -t "${IMAGE_REPO}:${IMAGE_TAG}" "${IMAGE_REPO}@${amd64}" "${IMAGE_REPO}@${arm64}"
-              index="$(jq -r '.["containerimage.descriptor"].digest' "${RUNNER_TEMP}/index-metadata.json")"
-              [[ "${index}" =~ ^sha256:[0-9a-f]{64}$ ]]
-              ;;
-            *)
-              exit 1
-              ;;
-          esac
-          # Platform digests come from the index itself, so a resumed run uses the real ones.
-          amd64="$(crane manifest "${IMAGE_REPO}@${index}" | jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest')"
-          arm64="$(crane manifest "${IMAGE_REPO}@${index}" | jq -r '.manifests[] | select(.platform.architecture=="arm64") | .digest')"
+          ./.github/scripts/xs-push-index.sh "${IMAGE_REPO}" "${IMAGE_TAG}" "${RUNNER_TEMP}/oci"
+      - name: Use the existing trusted index
+        id: existing
+        if: env.EXISTING != ''
+        run: |
+          set -euo pipefail
+          # registry-check already verified the signature, the provenance and the revision label.
+          manifest="$(crane manifest "${IMAGE_REPO}@${EXISTING}")"
           {
-            echo "digest=${index}"
-            echo "amd64_digest=${amd64}"
-            echo "arm64_digest=${arm64}"
+            echo "digest=${EXISTING}"
+            echo "amd64_digest=$(jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest' <<< "${manifest}")"
+            echo "arm64_digest=$(jq -r '.manifests[] | select(.platform.architecture=="arm64") | .digest' <<< "${manifest}")"
           } >> "${GITHUB_OUTPUT}"
       - name: Generate SBOMs (SPDX JSON, one per platform image)
+        if: env.EXISTING == ''
         env:
           AMD64: ${{ steps.index.outputs.amd64_digest }}
           ARM64: ${{ steps.index.outputs.arm64_digest }}
@@ -430,6 +567,7 @@ jobs:
           syft "${IMAGE_REPO}@${AMD64}" -o "spdx-json=${RUNNER_TEMP}/sbom-amd64.spdx.json"
           syft "${IMAGE_REPO}@${ARM64}" -o "spdx-json=${RUNNER_TEMP}/sbom-arm64.spdx.json"
       - name: Attest SBOM (amd64)
+        if: env.EXISTING == ''
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-name: ${{ env.IMAGE_REPO }}
@@ -437,6 +575,7 @@ jobs:
           sbom-path: ${{ runner.temp }}/sbom-amd64.spdx.json
           push-to-registry: true
       - name: Attest SBOM (arm64)
+        if: env.EXISTING == ''
         uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-name: ${{ env.IMAGE_REPO }}
@@ -444,23 +583,34 @@ jobs:
           sbom-path: ${{ runner.temp }}/sbom-arm64.spdx.json
           push-to-registry: true
       - name: Attest build provenance (index)
+        if: env.EXISTING == ''
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_REPO }}
           subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
       - name: Sign the index and the platform manifests
+        if: env.EXISTING == ''
         env:
           DIGEST: ${{ steps.index.outputs.digest }}
         run: |
           set -euo pipefail
           . .github/scripts/xs-lib.sh
-          xs_ensure_signed "${IMAGE_REPO}@${DIGEST}" "${IDENTITY}" --recursive
+          xs_sign "${IMAGE_REPO}@${DIGEST}" "${IDENTITY}" --recursive
 
   verify:
     needs: [prepare, publish]
-    runs-on: ubuntu-latest
+    if: always() && !failure() && !cancelled() && needs.publish.result == 'success'
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     permissions:
       contents: read
       packages: read
@@ -472,6 +622,7 @@ jobs:
       DIGEST: ${{ needs.publish.outputs.digest }}
       AMD64: ${{ needs.publish.outputs.amd64_digest }}
       ARM64: ${{ needs.publish.outputs.arm64_digest }}
+      ARCH: ${{ matrix.arch }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Check out CI scripts from the workflow commit
@@ -498,25 +649,29 @@ jobs:
           cosign verify --certificate-identity "${IDENTITY}" \
             --certificate-oidc-issuer "${XS_OIDC_ISSUER}" "${IMAGE_REPO}@${DIGEST}" > /dev/null
           echo "cosign verify ok: ${IMAGE_REPO}@${DIGEST}"
-      - name: Verify provenance and per-platform SBOM attestations
+      - name: Verify provenance and the SBOM attestation of this platform
         run: |
           set -euo pipefail
-          signer=xscaler/mimir/.github/workflows/xs-release.yml
-          gh attestation verify "oci://${IMAGE_REPO}@${DIGEST}" --repo xscaler/mimir --signer-workflow "${signer}"
-          for d in "${AMD64}" "${ARM64}"; do
-            gh attestation verify "oci://${IMAGE_REPO}@${d}" --repo xscaler/mimir --signer-workflow "${signer}" \
-              --predicate-type https://spdx.dev/Document/v2.3
-          done
+          platform_digest="${AMD64}"
+          [ "${ARCH}" = "arm64" ] && platform_digest="${ARM64}"
+          gh attestation verify "oci://${IMAGE_REPO}@${DIGEST}" --repo xscaler/mimir --cert-identity "${IDENTITY}"
+          gh attestation verify "oci://${IMAGE_REPO}@${platform_digest}" --repo xscaler/mimir --cert-identity "${IDENTITY}" \
+            --predicate-type https://spdx.dev/Document/v2.3
       - name: Run the image and check the version
         run: |
           set -euo pipefail
-          out="$(docker run --rm --platform linux/amd64 "${IMAGE_REPO}@${DIGEST}" -version)"
+          out="$(docker run --rm --platform "linux/${ARCH}" "${IMAGE_REPO}@${DIGEST}" -version)"
           echo "${out}"
           if [[ "${out}" != *"version ${VERSION} "* ]]; then
             echo "::error::the image reports a version other than ${VERSION}"
             exit 1
           fi
+          if [[ ! "${out}" =~ platform:[[:space:]]+linux/${ARCH} ]]; then
+            echo "::error::the binary does not report linux/${ARCH}"
+            exit 1
+          fi
       - name: Summary
+        if: matrix.arch == 'amd64'
         run: |
           {
             echo "### mimir ${VERSION}"
@@ -534,15 +689,30 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Create the tag if it does not exist
+      - name: Create the tag, or check that it points at the release commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.tag }}
           COMMIT: ${{ needs.prepare.outputs.commit }}
         run: |
           set -euo pipefail
-          if existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq .object.sha 2> /dev/null)"; then
-            echo "tag ${TAG} already exists (${existing})."
+          rc=0
+          out="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" --jq '.object.type + " " + .object.sha' 2>&1)" || rc=$?
+          if [ "${rc}" -eq 0 ]; then
+            read -r type sha <<< "${out}"
+            if [ "${type}" = "tag" ]; then
+              # Annotated tag: peel it to the commit.
+              sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${sha}" --jq .object.sha)"
+            fi
+            if [ "${sha}" != "${COMMIT}" ]; then
+              echo "::error::tag ${TAG} exists at ${sha}, not at the release commit ${COMMIT}"
+              exit 1
+            fi
+            echo "tag ${TAG} already points at ${COMMIT}."
             exit 0
+          fi
+          if ! printf '%s' "${out}" | grep -q 'HTTP 404'; then
+            printf '%s\n' "${out}" >&2
+            exit 1
           fi
           gh api "repos/${GITHUB_REPOSITORY}/git/refs" -f "ref=refs/tags/${TAG}" -f "sha=${COMMIT}"
