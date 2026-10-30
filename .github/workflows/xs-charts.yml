@@ -339,6 +339,7 @@ jobs:
       - name: Pull the chart and check its version
         run: |
           set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/pulled"
           helm pull "oci://${CHARTS_REPO}/${CHART_NAME}" --version "${VERSION}" --destination "${RUNNER_TEMP}/pulled"
           got="$(tar -xzOf "${RUNNER_TEMP}/pulled/${CHART_NAME}-${VERSION}.tgz" "${CHART_NAME}/Chart.yaml" | sed -n 's/^version: *//p' | head -n 1)"
           [ "${got}" = "${VERSION}" ] || { echo "::error::pulled chart version ${got}, expected ${VERSION}"; exit 1; }
