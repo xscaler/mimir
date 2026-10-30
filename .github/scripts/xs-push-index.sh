@@ -49,7 +49,14 @@ index="$(jq -r '.["containerimage.descriptor"].digest' "${work}/index-metadata.j
 manifest="$(crane manifest ${XS_CRANE_FLAGS:-} "${REPO}@${index}")"
 amd64="$(jq -r '.manifests[] | select(.platform.architecture=="amd64") | .digest' <<< "${manifest}")"
 arm64="$(jq -r '.manifests[] | select(.platform.architecture=="arm64") | .digest' <<< "${manifest}")"
-[ "${amd64}" = "${digests[amd64]}" ] && [ "${arm64}" = "${digests[arm64]}" ]
+for arch in amd64 arm64; do
+  got="${amd64}"
+  [ "${arch}" = "arm64" ] && got="${arm64}"
+  if [ "${got}" != "${digests[${arch}]}" ]; then
+    echo "::error::the index lists ${got} for ${arch}, expected ${digests[${arch}]}"
+    exit 1
+  fi
+done
 {
   echo "digest=${index}"
   echo "amd64_digest=${amd64}"

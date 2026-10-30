@@ -61,7 +61,7 @@ Params:
 {{- $tag := $image.tag -}}
 {{- /* xScaler: the engine image of this fork carries an -xs.<n> tag that differs from appVersion. */ -}}
 {{- $xscaler := .ctx.Values.xscaler | default dict -}}
-{{- if and (not $tag) $xscaler.engineTag (or (eq $image.repository (printf "%s/xscaler/mimir" ($xscaler.engineRegistry | default "ghcr.io"))) (hasSuffix "/xscaler/mimir" $image.repository)) -}}
+{{- if and (not $tag) $xscaler.engineTag (or (eq $image.repository "xscaler/mimir") (hasSuffix "/xscaler/mimir" $image.repository)) -}}
 {{- $tag = $xscaler.engineTag -}}
 {{- end -}}
 {{ $image.repository }}:{{ $tag | default .ctx.Chart.AppVersion }}

@@ -49,8 +49,9 @@ on:
 permissions: {}
 
 concurrency:
-  # One group per tag for releases, so reruns and bursts for the same tag queue instead of racing.
-  group: xs-release-${{ inputs.tag || format('{0}-{1}', github.event_name, github.ref) }}
+  # One group per ref and tag: reruns and bursts for the same release queue instead of racing, and a
+  # dispatch from another branch can never displace a pending release on main.
+  group: xs-release-${{ github.ref }}-${{ inputs.tag || github.event_name }}
   cancel-in-progress: false
 
 jobs:
@@ -398,7 +399,7 @@ jobs:
   sarif:
     # Separate job so the code that builds the image never holds security-events: write, and
     # pull requests never upload.
-    needs: image
+    needs: [prepare, image]
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -415,11 +416,17 @@ jobs:
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           sarif_file: sarif/trivy-amd64.sarif
+          # The release commit, not the dispatching workflow's commit.
+          sha: ${{ needs.prepare.outputs.commit }}
+          ref: ${{ github.ref }}
           category: trivy-mimir-amd64
       - name: Upload SARIF (arm64)
         uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           sarif_file: sarif/trivy-arm64.sarif
+          # The release commit, not the dispatching workflow's commit.
+          sha: ${{ needs.prepare.outputs.commit }}
+          ref: ${{ github.ref }}
           category: trivy-mimir-arm64
 
   dry-run:
@@ -434,7 +441,7 @@ jobs:
       contents: read
     services:
       registry:
-        image: registry:2
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
         ports:
           - 5000:5000
     env:
@@ -522,7 +529,8 @@ jobs:
   publish:
     needs: [prepare, registry-check, image]
     # Runs on the reuse path too, where binaries and image are skipped.
-    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.registry-check.result == 'success' && (needs.image.result == 'success' || needs.image.result == 'skipped') && (needs.prepare.outputs.mode == 'release' || needs.prepare.outputs.mode == 'rehearsal') }}
+    # Never starts when the build or the image failed, unless a trusted existing image is reused.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.registry-check.result == 'success' && (needs.image.result == 'success' || needs.registry-check.outputs.existing_digest != '') && (needs.prepare.outputs.mode == 'release' || needs.prepare.outputs.mode == 'rehearsal') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: ${{ needs.prepare.outputs.mode == 'release' && 'release' || 'rehearsal' }}
@@ -645,6 +653,7 @@ jobs:
       attestations: read
     env:
       IMAGE_REPO: ${{ needs.prepare.outputs.image_repo }}
+      IMAGE_TAG: ${{ needs.prepare.outputs.image_tag }}
       IDENTITY: ${{ needs.prepare.outputs.identity }}
       VERSION: ${{ needs.prepare.outputs.version }}
       DIGEST: ${{ needs.publish.outputs.digest }}
@@ -670,6 +679,14 @@ jobs:
           set -euo pipefail
           . .github/scripts/xs-lib.sh
           xs_install_cosign
+      - name: Check that the tag still points at the published digest
+        run: |
+          set -euo pipefail
+          tagged="$(docker buildx imagetools inspect "${IMAGE_REPO}:${IMAGE_TAG}" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [ "${tagged}" != "${DIGEST}" ]; then
+            echo "::error::${IMAGE_REPO}:${IMAGE_TAG} is at ${tagged}, expected ${DIGEST}"
+            exit 1
+          fi
       - name: Verify the cosign signature
         run: |
           set -euo pipefail
@@ -681,7 +698,9 @@ jobs:
         run: |
           set -euo pipefail
           platform_digest="${AMD64}"
-          [ "${ARCH}" = "arm64" ] && platform_digest="${ARM64}"
+          if [ "${ARCH}" = "arm64" ]; then
+            platform_digest="${ARM64}"
+          fi
           gh attestation verify "oci://${IMAGE_REPO}@${DIGEST}" --repo xscaler/mimir --cert-identity "${IDENTITY}"
           gh attestation verify "oci://${IMAGE_REPO}@${platform_digest}" --repo xscaler/mimir --cert-identity "${IDENTITY}" \
             --predicate-type https://spdx.dev/Document/v2.3

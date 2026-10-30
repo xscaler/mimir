@@ -7,6 +7,12 @@ on:
   schedule:
     - cron: '23 3 * * 2'
   workflow_dispatch:
+    inputs:
+      allow-missing-packages:
+        description: 'Treat a missing package as nothing to clean (only for the first run, before any rehearsal published)'
+        required: false
+        default: false
+        type: boolean
 
 permissions: {}
 
@@ -24,6 +30,7 @@ jobs:
       packages: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ALLOW_MISSING: ${{ inputs.allow-missing-packages && 'true' || 'false' }}
     steps:
       - name: Delete rehearsal package versions older than 14 days
         run: |
@@ -34,8 +41,12 @@ jobs:
             out="$(gh api --paginate "orgs/xscaler/packages/container/${pkg}/versions?per_page=100" --jq '.[] | "\(.id) \(.created_at)"' 2>&1)" || rc=$?
             if [ "${rc}" -ne 0 ]; then
               if printf '%s' "${out}" | grep -q 'HTTP 404'; then
-                echo "${pkg}: package does not exist, nothing to clean."
-                continue
+                if [ "${ALLOW_MISSING}" = "true" ]; then
+                  echo "${pkg}: package does not exist yet, nothing to clean (allowed for this run)."
+                  continue
+                fi
+                echo "::error::${pkg}: the packages API answered 404. Rehearsal packages should exist; if this is the first run before any rehearsal, dispatch with allow-missing-packages."
+                exit 1
               fi
               printf '%s\n' "${out}" >&2
               exit 1

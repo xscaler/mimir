@@ -84,9 +84,10 @@ jobs:
           . .github/scripts/xs-lib.sh
           xs_install_helm
       - name: Install chart-testing
-        uses: helm/chart-testing-action@720270857a28afd41e2426521a7801db09e9b510 # v2.9.0
-        with:
-          version: v3.15.0
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_ct
       - name: Resolve chart metadata
         id: meta
         env:
@@ -221,6 +222,7 @@ jobs:
       ENGINE_IMAGE: ${{ needs.verify.outputs.engine_image }}
     outputs:
       digest: ${{ steps.push.outputs.digest }}
+      ready: ${{ steps.engine.outputs.ready }}
     steps:
       - name: Check out repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -244,12 +246,40 @@ jobs:
           GH_ACTOR: ${{ github.actor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "${GH_TOKEN}" | helm registry login ghcr.io --username "${GH_ACTOR}" --password-stdin
-      - name: Check the engine image exists
-        if: env.MODE == 'release'
+      - name: Resolve and verify the engine image
+        id: engine
+        env:
+          RELEASE_IDENTITY: https://github.com/xscaler/mimir/.github/workflows/xs-release.yml@refs/heads/main
         run: |
           set -euo pipefail
-          crane manifest "${ENGINE_IMAGE}" > /dev/null || { echo "::error::engine image ${ENGINE_IMAGE} is not published, release the image before the chart"; exit 1; }
+          . .github/scripts/xs-lib.sh
+          if [ "${MODE}" != "release" ]; then
+            # A rehearsal packages the chart without requiring a released engine image.
+            echo "ready=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          rc=0
+          digest="$(xs_tag_digest mimir "${ENGINE_IMAGE}")" || rc=$?
+          case "${rc}" in
+            0) ;;
+            1)
+              echo "::notice::engine image ${ENGINE_IMAGE} is not released yet; re-run this workflow after the image release"
+              echo "ready=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+              ;;
+            *) exit 1 ;;
+          esac
+          repo="${ENGINE_IMAGE%:*}"
+          # A present tag is not enough: the image must carry a signature and a provenance
+          # attestation from the release workflow on main.
+          cosign verify --certificate-identity "${RELEASE_IDENTITY}" --certificate-oidc-issuer "${XS_OIDC_ISSUER}" \
+            "${repo}@${digest}" > /dev/null || { echo "::error::engine image ${ENGINE_IMAGE} exists without a valid release signature"; exit 1; }
+          gh attestation verify "oci://${repo}@${digest}" --repo xscaler/mimir --cert-identity "${RELEASE_IDENTITY}" \
+            > /dev/null || { echo "::error::engine image ${ENGINE_IMAGE} exists without a valid release provenance attestation"; exit 1; }
+          echo "engine image ${ENGINE_IMAGE} verified at ${digest}"
+          echo "ready=true" >> "${GITHUB_OUTPUT}"
       - name: Package the chart
+        if: steps.engine.outputs.ready == 'true'
         run: |
           set -euo pipefail
           helm repo add minio https://charts.min.io/
@@ -258,6 +288,7 @@ jobs:
           helm package "${CHART_DIR}" --version "${VERSION}" --destination "${RUNNER_TEMP}/pkg"
       - name: Push, or compare with the chart already in GHCR
         id: push
+        if: steps.engine.outputs.ready == 'true'
         run: |
           set -euo pipefail
           . .github/scripts/xs-lib.sh
@@ -278,13 +309,28 @@ jobs:
                 "${ref}@${existing}" > /dev/null || untrusted "no valid signature from ${IDENTITY}"
               gh attestation verify "oci://${ref}@${existing}" --repo xscaler/mimir --cert-identity "${IDENTITY}" \
                 > /dev/null || untrusted "no valid provenance attestation from ${IDENTITY}"
-              helm pull "oci://${ref}" --version "${VERSION}" --untar --untardir "${RUNNER_TEMP}/published"
-              norm() { sed 's/mimir-distributed-[0-9][0-9A-Za-z._+-]*/CHART_LABEL/g; s#\(checksum/[a-z-]*:\) .*#\1 X#'; }
+              # Pull by the verified digest, not by the tag.
+              helm pull "oci://${ref}@${existing}" --untar --untardir "${RUNNER_TEMP}/published"
+              render() {
+                local out
+                if ! out="$(helm template rel "$@" 2> "${RUNNER_TEMP}/render.err")"; then
+                  echo "::error::helm template failed for $*"
+                  cat "${RUNNER_TEMP}/render.err" >&2
+                  exit 1
+                fi
+                if [ -z "${out}" ]; then
+                  echo "::error::helm template rendered nothing for $*"
+                  exit 1
+                fi
+                printf '%s\n' "${out}" | sed 's/mimir-distributed-[0-9][0-9A-Za-z._+-]*/CHART_LABEL/g; s#\(checksum/[a-z-]*:\) .*#\1 X#'
+              }
               for f in "" "${CHART_DIR}"/ci/*.yaml; do
                 args=()
-                [ -n "${f}" ] && args=(-f "${f}")
-                helm template rel "${CHART_DIR}" "${args[@]}" 2> /dev/null | norm > "${RUNNER_TEMP}/ours.yaml"
-                helm template rel "${RUNNER_TEMP}/published/${CHART_NAME}" "${args[@]}" 2> /dev/null | norm > "${RUNNER_TEMP}/theirs.yaml"
+                if [ -n "${f}" ]; then
+                  args=(-f "${f}")
+                fi
+                render "${CHART_DIR}" "${args[@]}" > "${RUNNER_TEMP}/ours.yaml"
+                render "${RUNNER_TEMP}/published/${CHART_NAME}" "${args[@]}" > "${RUNNER_TEMP}/theirs.yaml"
                 if ! diff -q "${RUNNER_TEMP}/ours.yaml" "${RUNNER_TEMP}/theirs.yaml" > /dev/null; then
                   diff "${RUNNER_TEMP}/ours.yaml" "${RUNNER_TEMP}/theirs.yaml" | head -20
                   untrusted "renders differently from this commit (values ${f:-default})"
@@ -305,14 +351,14 @@ jobs:
               ;;
           esac
       - name: Attest build provenance
-        if: steps.push.outputs.pushed == 'true'
+        if: steps.engine.outputs.ready == 'true' && steps.push.outputs.pushed == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.CHARTS_REPO }}/${{ env.CHART_NAME }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
       - name: Sign the chart pushed by this run
-        if: steps.push.outputs.pushed == 'true'
+        if: steps.engine.outputs.ready == 'true' && steps.push.outputs.pushed == 'true'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
@@ -322,6 +368,7 @@ jobs:
 
   verify-published:
     needs: [verify, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.publish.outputs.ready == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

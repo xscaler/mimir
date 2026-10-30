@@ -27,14 +27,12 @@ nameOverride: null
 # Note: Grafana provided dashboards rely on the default naming and will need changes.
 fullnameOverride: null
 
-# xScaler build of the engine. The image helper uses engineTag instead of appVersion
-# when the resolved image repository is the xScaler engine repository
-# (<engineRegistry>/xscaler/mimir, or the same path on a mirror) and no image.tag is set
-# at the global or component level. Any other repository, for example grafana/enterprise-metrics
-# or a mirror of grafana/mimir, keeps the upstream behaviour.
+# xScaler build of the engine. The image helper uses engineTag instead of appVersion when the
+# resolved image repository is the xScaler engine repository (ghcr.io/xscaler/mimir, a bare
+# xscaler/mimir, or xscaler/mimir on a mirror) and no image.tag is set at the global or component
+# level. Any other repository, for example grafana/enterprise-metrics or a mirror of grafana/mimir,
+# keeps the upstream behaviour.
 xscaler:
-  # -- Registry of the xScaler engine image
-  engineRegistry: ghcr.io
   # -- Tag of the xScaler engine image
   engineTag: 3.2.3-xs.0
 

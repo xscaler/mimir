@@ -15,6 +15,11 @@ SYFT_VERSION="1.55.0"
 SYFT_SHA256="bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d"
 TRIVY_VERSION="0.76.1"
 TRIVY_SHA256="c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0"
+CT_VERSION="3.15.0"
+CT_SHA256="467561730f25fe09d5e6cd09a3e1f6aa759871c657a57602947c716d9be2c583"
+# ct lint needs these python packages, pinned by version.
+YAMLLINT_VERSION="1.38.0"
+YAMALE_VERSION="6.1.0"
 HELM_VERSION="4.2.3"
 HELM_SHA256="e9b88b4ee95b18c706839c28d3a0220e5bc470e9cd9262410c90793c45ff8b7c"
 
@@ -75,6 +80,24 @@ xs_install_trivy() {
   _xs_fetch "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" "${TRIVY_SHA256}" "${tgz}"
   tar -xzf "${tgz}" -C "${dir}" trivy
   rm -f "${tgz}"
+}
+
+# xs_install_ct: chart-testing (amd64) with its config files, plus the python tools ct lint calls.
+xs_install_ct() {
+  local dir tgz venv
+  dir="$(_xs_bindir)"
+  tgz="${dir}/ct.tgz"
+  _xs_fetch "https://github.com/helm/chart-testing/releases/download/v${CT_VERSION}/chart-testing_${CT_VERSION}_linux_amd64.tar.gz" "${CT_SHA256}" "${tgz}"
+  mkdir -p "${dir}/ct-extract" "${HOME}/.ct"
+  tar -xzf "${tgz}" -C "${dir}/ct-extract"
+  mv "${dir}/ct-extract/ct" "${dir}/ct"
+  cp "${dir}/ct-extract/etc/chart_schema.yaml" "${dir}/ct-extract/etc/lintconf.yaml" "${HOME}/.ct/"
+  rm -rf "${tgz}" "${dir}/ct-extract"
+  venv="${RUNNER_TEMP:?}/xs-venv"
+  python3 -m venv "${venv}"
+  "${venv}/bin/pip" install --quiet "yamllint==${YAMLLINT_VERSION}" "yamale==${YAMALE_VERSION}"
+  echo "${venv}/bin" >> "${GITHUB_PATH:?}"
+  export PATH="${venv}/bin:${PATH}"
 }
 
 xs_install_helm() {

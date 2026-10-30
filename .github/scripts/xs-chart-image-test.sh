@@ -17,8 +17,12 @@ mkdir -p "${TMP}/base"
 git archive "${BASE_TAG}" operations/helm operations/mimir-mixin-compiled operations/mimir-mixin-compiled-baremetal | tar -x -C "${TMP}/base"
 BASE="${TMP}/base/${CHART_DIR}"
 
-helm dependency build "${BASE}" > /dev/null 2>&1
-helm dependency build "${CHART_DIR}" > /dev/null 2>&1
+for d in "${BASE}" "${CHART_DIR}"; do
+  if ! helm dependency build "${d}" > "${TMP}/dep.log" 2>&1; then
+    cat "${TMP}/dep.log" >&2
+    exit 1
+  fi
+done
 
 OUR_VERSION="$(sed -n 's/^version: *//p' "${CHART_DIR}/Chart.yaml" | head -n 1)"
 BASE_VERSION="$(sed -n 's/^version: *//p' "${BASE}/Chart.yaml" | head -n 1)"
@@ -30,13 +34,23 @@ APP_VERSION="$(sed -n 's/^appVersion: *//p' "${CHART_DIR}/Chart.yaml" | head -n 
 ENGINE_TAG="$(sed -n 's/^  engineTag: *//p' "${CHART_DIR}/values.yaml" | head -n 1)"
 fail=0
 
-# render DIR LABEL ARGS...: render with the chart version label normalised.
+# render DIR LABEL ARGS...: render with the chart version label normalised. A failing or empty
+# render stops the test and shows helm's stderr.
 render() {
-  local dir="$1" label="$2"
+  local dir="$1" label="$2" out
   shift 2
+  if ! out="$(helm template rel "${dir}" "$@" 2> "${TMP}/stderr")"; then
+    echo "helm template failed for ${dir} $*:" >&2
+    cat "${TMP}/stderr" >&2
+    exit 1
+  fi
+  if [ -z "${out}" ]; then
+    echo "helm template rendered nothing for ${dir} $*" >&2
+    exit 1
+  fi
   # checksum/* annotations hash rendered objects that carry the chart version label, so they
   # change with the +xs.<n> chart version alone.
-  helm template rel "${dir}" "$@" 2> /dev/null | sed "s/${label}/CHART_LABEL/g; s#\(checksum/[a-z-]*:\) .*#\1 X#"
+  printf '%s\n' "${out}" | sed "s/${label}/CHART_LABEL/g; s#\(checksum/[a-z-]*:\) .*#\1 X#"
 }
 
 # check NAME OUR_ARGS BASE_ARGS SED_EXPR: render both and require identical output after
@@ -66,6 +80,9 @@ check "default: only the engine image differs" "" "" \
 check "mirror of xscaler/mimir keeps the mirror and the engine tag" \
   "--set image.repository=mirror.example.com/xscaler/mimir" "--set image.repository=mirror.example.com/xscaler/mimir" \
   "s#mirror.example.com/xscaler/mimir:${ENGINE_TAG}#mirror.example.com/xscaler/mimir:${APP_VERSION}#g"
+check "bare xscaler/mimir repository gets the engine tag" \
+  "--set image.repository=xscaler/mimir" "--set image.repository=xscaler/mimir" \
+  "s#xscaler/mimir:${ENGINE_TAG}#xscaler/mimir:${APP_VERSION}#g"
 # 3. A repository-only override of another image keeps the upstream behaviour.
 check "mirror of grafana/mimir is unchanged" \
   "--set image.repository=mirror.example.com/grafana/mimir" "--set image.repository=mirror.example.com/grafana/mimir" ""
