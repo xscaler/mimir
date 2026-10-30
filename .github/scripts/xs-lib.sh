@@ -66,28 +66,3 @@ xs_ensure_signed() {
     --certificate-oidc-issuer "${XS_OIDC_ISSUER}" "${ref}" > /dev/null
   echo "signed and verified: ${ref}"
 }
-
-# xs_copy_digest SRC_REPO DIGEST DST_REPO TAG: copy by digest to an immutable
-# destination. A tag that already exists must point at the same digest.
-xs_copy_digest() {
-  local src="$1" digest="$2" dst="$3" tag="$4" existing rc
-  set +e
-  existing="$(xs_digest "${dst}:${tag}")"
-  rc=$?
-  set -e
-  case "${rc}" in
-    0)
-      if [ "${existing}" != "${digest}" ]; then
-        echo "::error::${dst}:${tag} exists with digest ${existing}, expected ${digest} (tags are immutable)"
-        return 1
-      fi
-      echo "${dst}:${tag} already at ${digest}"
-      ;;
-    1)
-      crane copy "${src}@${digest}" "${dst}:${tag}"
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
