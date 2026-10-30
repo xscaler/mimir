@@ -438,7 +438,7 @@ jobs:
     # registry in verify mode, so a pull request exercises it before a release does. Signing and
     # attestations need OIDC and only run in publish.
     needs: [prepare, image]
-    if: needs.prepare.outputs.mode == 'verify'
+    if: needs.prepare.outputs.mode == 'verify' || needs.prepare.outputs.mode == 'rehearsal'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
