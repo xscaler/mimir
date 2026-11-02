@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Table tests for the version and tag selection in xs-sync.sh and its small
 # pure helpers. No network, no GitHub token. Run: .github/scripts/xs-sync-test.sh
-# shellcheck disable=SC2016,SC2034,SC2046,SC2086,SC2317,SC2329 # word splitting of tag lists and mock functions are intended
+# shellcheck disable=SC2016,SC2034,SC2046,SC2086,SC2154,SC2248,SC2249,SC2310,SC2317,SC2329 # word splitting of tag lists and mock functions are intended
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

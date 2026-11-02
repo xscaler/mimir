@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
+# shellcheck disable=SC2310,SC2249 # helpers run in if/|| on purpose and case statements without a default are intended
 # xScaler fork: upstream sync logic, shared by xs-sync.yml and xs-sync-check.yml.
 #
 # The fork's main is "upstream release tag + our patch set". For each new
