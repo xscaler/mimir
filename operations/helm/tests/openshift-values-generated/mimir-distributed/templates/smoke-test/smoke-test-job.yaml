@@ -33,6 +33,7 @@ spec:
         []
       containers:
         - name: smoke-test
+          image: ghcr.io/xscaler/mimir:3.2.3-xs.0
           imagePullPolicy: IfNotPresent
           args:
             - "-target=continuous-test"

@@ -1,0 +1,421 @@
+# Lint, render, test and publish the mimir-distributed Helm chart to GHCR.
+#
+# The chart is an import of the upstream release chart, not the weekly chart that main carries
+# upstream. To move to a new upstream chart release (mimir-distributed-<x.y.z>, whose appVersion
+# matches the engine version in VERSION), check out these paths from that upstream tag:
+#   operations/helm
+#   operations/mimir-mixin-compiled
+#   operations/mimir-mixin-compiled-baremetal
+#   docs/sources/helm-charts
+# commit that as the import, then re-apply the xScaler patch: default image.repository
+# ghcr.io/xscaler/mimir, the xscaler.engineTag value and its use in the image helper, the chart
+# version <version>+xs.0, and run `make build-helm-tests` to regenerate the golden records.
+#
+# Modes, chosen in the verify job:
+#   release    push to main with a +xs.<n> chart version: publishes oci://ghcr.io/xscaler/charts.
+#   rehearsal  push to ci/**: the same publish path against oci://ghcr.io/xscaler/rehearsal/charts
+#              with version <version>+rehearsal.<shortsha>.
+#   verify     pull requests and everything else: checks only.
+# Upstream weekly and release chart versions are never published. Production pulls through an ECR
+# pull-through cache of GHCR, so nothing is pushed to ECR.
+name: xs-charts
+
+on:
+  push:
+    branches:
+      - main
+      - 'ci/**'
+    paths:
+      - 'operations/helm/**'
+      - 'operations/mimir-mixin-compiled/**'
+      - 'operations/mimir-mixin-compiled-baremetal/**'
+      - 'docs/sources/helm-charts/**'
+      - '.github/workflows/xs-charts.yml'
+      - '.github/scripts/xs-*'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'operations/helm/**'
+      - 'operations/mimir-mixin-compiled/**'
+      - 'operations/mimir-mixin-compiled-baremetal/**'
+      - 'docs/sources/helm-charts/**'
+      - '.github/workflows/xs-charts.yml'
+      - '.github/scripts/xs-*'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: xs-charts-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CHART_DIR: operations/helm/charts/mimir-distributed
+  CHART_NAME: mimir-distributed
+
+jobs:
+  verify:
+    # Same-repo PRs are already covered by the push trigger on their branch.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.meta.outputs.mode }}
+      version: ${{ steps.meta.outputs.version }}
+      oci_tag: ${{ steps.meta.outputs.oci_tag }}
+      charts_repo: ${{ steps.meta.outputs.charts_repo }}
+      package: ${{ steps.meta.outputs.package }}
+      identity: ${{ steps.meta.outputs.identity }}
+      engine_image: ${{ steps.engine.outputs.image }}
+      build_image: ${{ steps.engine.outputs.build_image }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Install Helm
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_helm
+      - name: Install chart-testing
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_ct
+      - name: Resolve chart metadata
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version: *//p' "${CHART_DIR}/Chart.yaml" | head -n 1)"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+xs\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::chart version ${version} is not <upstream-version>+xs.<n>"
+            exit 1
+          fi
+          mode=verify
+          charts_repo=ghcr.io/xscaler/charts
+          package="charts/${CHART_NAME}"
+          if [[ "${EVENT_NAME}" == "push" && "${REF}" == "refs/heads/main" ]]; then
+            mode=release
+          elif [[ "${EVENT_NAME}" == "push" && "${REF}" == refs/heads/ci/* ]]; then
+            mode=rehearsal
+            short="$(git rev-parse --short=12 "${WORKFLOW_SHA}")"
+            version="${version%%+*}+rehearsal.${short}"
+            charts_repo=ghcr.io/xscaler/rehearsal/charts
+            package="rehearsal/charts/${CHART_NAME}"
+          fi
+          {
+            echo "mode=${mode}"
+            echo "version=${version}"
+            # Helm stores the + of SemVer build metadata as _ in OCI tags.
+            echo "oci_tag=${version//+/_}"
+            echo "charts_repo=${charts_repo}"
+            echo "package=${package}"
+            echo "identity=https://github.com/${WORKFLOW_REF}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Add chart repositories and build dependencies
+        run: |
+          set -euo pipefail
+          helm repo add minio https://charts.min.io/
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm dependency build "${CHART_DIR}"
+      - name: helm lint
+        run: |
+          set -euo pipefail
+          helm lint "${CHART_DIR}"
+          for f in "${CHART_DIR}"/ci/*.yaml; do
+            echo "helm lint with ${f}"
+            helm lint "${CHART_DIR}" -f "${f}"
+          done
+      - name: Assert the engine image tag starts with appVersion
+        id: engine
+        run: |
+          set -euo pipefail
+          app="$(sed -n 's/^appVersion: *//p' "${CHART_DIR}/Chart.yaml" | head -n 1 | tr -d '"')"
+          images="$(helm template ci "${CHART_DIR}" | sed -n 's#^ *\(- \)\{0,1\}image: *"\{0,1\}\(ghcr.io/xscaler/mimir:[^" ]*\).*#\2#p' | sort -u)"
+          echo "engine images: ${images}"
+          if [ "$(printf '%s\n' "${images}" | grep -c .)" -ne 1 ]; then
+            echo "::error::expected exactly one engine image in the rendered chart"
+            exit 1
+          fi
+          case "${images#ghcr.io/xscaler/mimir:}" in
+            "${app}"*) ;;
+            *) echo "::error::engine tag ${images} does not start with appVersion ${app}"; exit 1 ;;
+          esac
+          echo "image=${images}" >> "${GITHUB_OUTPUT}"
+          echo "build_image=$(make print-build-image)" >> "${GITHUB_OUTPUT}"
+      - name: Render test against the upstream release chart
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version: *//p' "${CHART_DIR}/Chart.yaml" | head -n 1)"
+          ./.github/scripts/xs-chart-image-test.sh "${CHART_NAME}-${version%%+*}"
+      - name: ct lint
+        run: ct lint --config operations/helm/ct.yaml --charts "${CHART_DIR}" --check-version-increment=false
+      - name: helm template against the CI values
+        run: |
+          set -euo pipefail
+          helm template ci-default "${CHART_DIR}" > /dev/null
+          for f in "${CHART_DIR}"/ci/*.yaml; do
+            echo "helm template with ${f}"
+            helm template ci "${CHART_DIR}" -f "${f}" > /dev/null
+          done
+
+  golden:
+    # Upstream's chart tests: golden records and conftest policies.
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.verify.outputs.build_image }} # zizmor: ignore[unpinned-images] The image output produced by the verify job is pinned
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Run Git Config
+        run: git config --global --add safe.directory '*'
+      - name: Symlink Expected Path to Workspace
+        run: |
+          mkdir -p /go/src/github.com/grafana/mimir
+          ln -s "$GITHUB_WORKSPACE"/* /go/src/github.com/grafana/mimir
+      - name: Check Helm Tests
+        run: make BUILD_IN_CONTAINER=false check-helm-tests
+      # Mirror of the conftest job of upstream's helm-ci.yml.
+      - name: Lint Rego Policies
+        run: make BUILD_IN_CONTAINER=false check-conftest-fmt
+      - name: Run conftest policy unit tests
+        env:
+          TEMP_DIR: ${{ runner.temp }}/conftest
+        run: make BUILD_IN_CONTAINER=false conftest-verify
+
+  publish:
+    needs: [verify, golden]
+    if: needs.verify.outputs.mode == 'release' || needs.verify.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ needs.verify.outputs.mode == 'release' && 'release' || 'rehearsal' }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      MODE: ${{ needs.verify.outputs.mode }}
+      VERSION: ${{ needs.verify.outputs.version }}
+      OCI_TAG: ${{ needs.verify.outputs.oci_tag }}
+      CHARTS_REPO: ${{ needs.verify.outputs.charts_repo }}
+      PACKAGE: ${{ needs.verify.outputs.package }}
+      IDENTITY: ${{ needs.verify.outputs.identity }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ENGINE_IMAGE: ${{ needs.verify.outputs.engine_image }}
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      ready: ${{ steps.engine.outputs.ready }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Helm, crane and cosign
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_helm
+          xs_install_crane
+          xs_install_cosign
+      - name: Log in to GHCR for Helm
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GH_TOKEN}" | helm registry login ghcr.io --username "${GH_ACTOR}" --password-stdin
+      - name: Resolve and verify the engine image
+        id: engine
+        env:
+          RELEASE_IDENTITY: https://github.com/xscaler/mimir/.github/workflows/xs-release.yml@refs/heads/main
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          if [ "${MODE}" != "release" ]; then
+            # A rehearsal packages the chart without requiring a released engine image.
+            echo "ready=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          rc=0
+          digest="$(xs_tag_digest mimir "${ENGINE_IMAGE}")" || rc=$?
+          case "${rc}" in
+            0) ;;
+            1)
+              echo "::notice::engine image ${ENGINE_IMAGE} is not released yet; re-run this workflow after the image release"
+              echo "ready=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+              ;;
+            *) exit 1 ;;
+          esac
+          repo="${ENGINE_IMAGE%:*}"
+          # A present tag is not enough: the image must carry a signature and a provenance
+          # attestation from the release workflow on main.
+          cosign verify --certificate-identity "${RELEASE_IDENTITY}" --certificate-oidc-issuer "${XS_OIDC_ISSUER}" \
+            "${repo}@${digest}" > /dev/null || { echo "::error::engine image ${ENGINE_IMAGE} exists without a valid release signature"; exit 1; }
+          gh attestation verify "oci://${repo}@${digest}" --repo xscaler/mimir --cert-identity "${RELEASE_IDENTITY}" \
+            > /dev/null || { echo "::error::engine image ${ENGINE_IMAGE} exists without a valid release provenance attestation"; exit 1; }
+          echo "engine image ${ENGINE_IMAGE} verified at ${digest}"
+          echo "ready=true" >> "${GITHUB_OUTPUT}"
+      - name: Package the chart
+        if: steps.engine.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          helm repo add minio https://charts.min.io/
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm dependency build "${CHART_DIR}"
+          helm package "${CHART_DIR}" --version "${VERSION}" --destination "${RUNNER_TEMP}/pkg"
+      - name: Push, or compare with the chart already in GHCR
+        id: push
+        if: steps.engine.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          ref="${CHARTS_REPO}/${CHART_NAME}"
+          rc=0
+          existing="$(xs_tag_digest "${PACKAGE}" "${ref}:${OCI_TAG}")" || rc=$?
+          case "${rc}" in
+            0)
+              # Never trust or sign what is found in the registry: accept it only with a valid
+              # signature and provenance attestation from this workflow's identity and identical
+              # rendered content.
+              echo "Chart ${CHART_NAME} ${VERSION} already in GHCR at ${existing}, checking that it can be trusted."
+              untrusted() {
+                echo "::error::chart exists without trusted provenance (${1}): investigate, then bump the chart version"
+                exit 1
+              }
+              cosign verify --certificate-identity "${IDENTITY}" --certificate-oidc-issuer "${XS_OIDC_ISSUER}" \
+                "${ref}@${existing}" > /dev/null || untrusted "no valid signature from ${IDENTITY}"
+              gh attestation verify "oci://${ref}@${existing}" --repo xscaler/mimir --cert-identity "${IDENTITY}" \
+                > /dev/null || untrusted "no valid provenance attestation from ${IDENTITY}"
+              # Pull by the verified digest, not by the tag.
+              helm pull "oci://${ref}@${existing}" --untar --untardir "${RUNNER_TEMP}/published"
+              render() {
+                local out
+                if ! out="$(helm template rel "$@" 2> "${RUNNER_TEMP}/render.err")"; then
+                  echo "::error::helm template failed for $*"
+                  cat "${RUNNER_TEMP}/render.err" >&2
+                  exit 1
+                fi
+                if [ -z "${out}" ]; then
+                  echo "::error::helm template rendered nothing for $*"
+                  exit 1
+                fi
+                printf '%s\n' "${out}" | sed 's/mimir-distributed-[0-9][0-9A-Za-z._+-]*/CHART_LABEL/g; s#\(checksum/[a-z-]*:\) .*#\1 X#'
+              }
+              for f in "" "${CHART_DIR}"/ci/*.yaml; do
+                args=()
+                if [ -n "${f}" ]; then
+                  args=(-f "${f}")
+                fi
+                render "${CHART_DIR}" "${args[@]}" > "${RUNNER_TEMP}/ours.yaml"
+                render "${RUNNER_TEMP}/published/${CHART_NAME}" "${args[@]}" > "${RUNNER_TEMP}/theirs.yaml"
+                if ! diff -q "${RUNNER_TEMP}/ours.yaml" "${RUNNER_TEMP}/theirs.yaml" > /dev/null; then
+                  diff "${RUNNER_TEMP}/ours.yaml" "${RUNNER_TEMP}/theirs.yaml" | head -20
+                  untrusted "renders differently from this commit (values ${f:-default})"
+                fi
+              done
+              echo "digest=${existing}" >> "${GITHUB_OUTPUT}"
+              echo "pushed=false" >> "${GITHUB_OUTPUT}"
+              ;;
+            1)
+              helm push "${RUNNER_TEMP}/pkg/${CHART_NAME}-${VERSION}.tgz" "oci://${CHARTS_REPO}" 2>&1 | tee "${RUNNER_TEMP}/push.log"
+              digest="$(sed -n 's/^Digest: *//p' "${RUNNER_TEMP}/push.log" | tail -n 1)"
+              [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+              echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+              echo "pushed=true" >> "${GITHUB_OUTPUT}"
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+      - name: Attest build provenance
+        if: steps.engine.outputs.ready == 'true' && steps.push.outputs.pushed == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.CHARTS_REPO }}/${{ env.CHART_NAME }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Sign the chart pushed by this run
+        if: steps.engine.outputs.ready == 'true' && steps.push.outputs.pushed == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_sign "${CHARTS_REPO}/${CHART_NAME}@${DIGEST}" "${IDENTITY}"
+
+  verify-published:
+    needs: [verify, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' && needs.publish.outputs.ready == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    env:
+      CHARTS_REPO: ${{ needs.verify.outputs.charts_repo }}
+      IDENTITY: ${{ needs.verify.outputs.identity }}
+      VERSION: ${{ needs.verify.outputs.version }}
+      DIGEST: ${{ needs.publish.outputs.digest }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install Helm and cosign
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          xs_install_helm
+          xs_install_cosign
+      - name: Log in to GHCR
+        env:
+          GH_ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${GH_TOKEN}" | helm registry login ghcr.io --username "${GH_ACTOR}" --password-stdin
+          # cosign reads the same credentials.
+          mkdir -p "${HOME}/.docker"
+          auth="$(printf '%s:%s' "${GH_ACTOR}" "${GH_TOKEN}" | base64 -w0)"
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${auth}" > "${HOME}/.docker/config.json"
+      - name: Verify signature and attestation
+        run: |
+          set -euo pipefail
+          . .github/scripts/xs-lib.sh
+          cosign verify --certificate-identity "${IDENTITY}" \
+            --certificate-oidc-issuer "${XS_OIDC_ISSUER}" "${CHARTS_REPO}/${CHART_NAME}@${DIGEST}" > /dev/null
+          gh attestation verify "oci://${CHARTS_REPO}/${CHART_NAME}@${DIGEST}" --repo xscaler/mimir \
+            --cert-identity "${IDENTITY}"
+      - name: Pull the chart and check its version
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/pulled"
+          helm pull "oci://${CHARTS_REPO}/${CHART_NAME}" --version "${VERSION}" --destination "${RUNNER_TEMP}/pulled"
+          got="$(tar -xzOf "${RUNNER_TEMP}/pulled/${CHART_NAME}-${VERSION}.tgz" "${CHART_NAME}/Chart.yaml" | sed -n 's/^version: *//p' | head -n 1)"
+          [ "${got}" = "${VERSION}" ] || { echo "::error::pulled chart version ${got}, expected ${VERSION}"; exit 1; }
+          echo "### ${CHART_NAME} ${VERSION}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- ${CHARTS_REPO}/${CHART_NAME}@${DIGEST}" >> "${GITHUB_STEP_SUMMARY}"

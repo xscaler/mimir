@@ -82,6 +82,7 @@ spec:
             name: keda-autoscaling-global-values-mimir-alertmanager-fallback-config
       containers:
         - name: alertmanager
+          image: ghcr.io/xscaler/mimir:3.2.3-xs.0
           imagePullPolicy: IfNotPresent
           args:
             - "-target=alertmanager"
