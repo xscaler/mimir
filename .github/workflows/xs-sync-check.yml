@@ -1,0 +1,174 @@
+# xScaler fork: validate upstream sync PRs and test the sync scripts.
+#
+# unit         shellcheck and table tests for xs-sync.sh (every PR, and ci/** pushes).
+# identity     sync/<tag> PRs only (checker script taken from the base sha): nothing outside the patch paths differs from the
+#              upstream tag, the chart paths differ from the chart release named by the
+#              head's Chart.yaml only in the chart patch paths, the merge parents are main and the tag, and the tag is the
+#              newest upstream release in the commit's history (the rule xs-release
+#              applies to a release commit).
+# flagdiff     sync/<tag> PRs (and a smoke test on ci/** pushes): build main and the PR head (linux/amd64) and diff
+#              the -help and -help-all flag sets. Informational; goes to the job summary and into
+#              the PR body placeholder.
+# annotate     fills the PR body placeholder. Runs trusted code from the base branch and
+#              holds the only write token; the job that builds PR code has none.
+#
+# The regular xs-test and xs-release verify runs cover sync PRs like any other PR.
+name: xs-sync-check
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - "ci/**"
+
+permissions: {}
+
+concurrency:
+  group: xs-sync-check-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: sync script tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          source .github/scripts/xs-lib.sh
+          xs_install_shellcheck
+
+      - name: shellcheck
+        run: shellcheck -x .github/scripts/xs-sync.sh .github/scripts/xs-sync-test.sh
+
+      - name: Selection and helper tests
+        run: .github/scripts/xs-sync-test.sh
+
+  identity:
+    name: identity with upstream
+    if: github.event_name == 'pull_request' && startsWith(github.head_ref, 'sync/') && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      # The checker comes from the base branch; the PR head is only data it inspects.
+      - name: Checkout the checker from the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Checkout the PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: head
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Check
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CHECKER: ${{ github.workspace }}/trusted/.github/scripts/xs-sync.sh
+        run: |
+          set -euo pipefail
+          tag="${HEAD_REF#sync/}"
+          cd head
+          git rev-parse --verify --quiet "origin/main" > /dev/null
+          "${CHECKER}" check identity "${tag}" "${HEAD_SHA}"
+          "${CHECKER}" check parents "${tag}" "${HEAD_SHA}"
+          "${CHECKER}" check version "${tag}" "${HEAD_SHA}"
+
+  flagdiff:
+    name: flag diff
+    # Pushes to ci/** diff the commit against itself: a smoke test of the build,
+    # the help output and the report, with no flag changes expected.
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && startsWith(github.head_ref, 'sync/') && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: old
+          persist-credentials: false
+
+      - name: Checkout the PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: new
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: new/go.mod
+          cache: false
+
+      - name: Diff the flag sets
+        run: old/.github/scripts/xs-sync.sh flagdiff old new "${RUNNER_TEMP}/flag-diff.md"
+
+      - name: Summary
+        run: cat "${RUNNER_TEMP}/flag-diff.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: flag-diff
+          path: ${{ runner.temp }}/flag-diff.md
+          if-no-files-found: error
+          retention-days: 7
+
+  annotate:
+    name: fill the PR body
+    needs: flagdiff
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write # edit the sync PR body
+    steps:
+      - name: Checkout trusted scripts from the base branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: flag-diff
+          path: ${{ runner.temp }}/flag-diff
+
+      - name: Fill the placeholder
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/flag-diff"
+          gh pr view "${PR}" --json body --jq .body > "${dir}/body.md"
+          { echo "Run: ${RUN_URL}"; echo; head -c 40000 "${dir}/flag-diff.md"; } > "${dir}/fill.md"
+          .github/scripts/xs-sync.sh body-fill "${dir}/body.md" "${dir}/fill.md" > "${dir}/new-body.md"
+          gh pr edit "${PR}" --body-file "${dir}/new-body.md"
