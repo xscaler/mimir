@@ -20,6 +20,8 @@ CT_SHA256="467561730f25fe09d5e6cd09a3e1f6aa759871c657a57602947c716d9be2c583"
 # ct lint needs these python packages, pinned by version.
 YAMLLINT_VERSION="1.38.0"
 YAMALE_VERSION="6.1.0"
+SHELLCHECK_VERSION="0.9.0"
+SHELLCHECK_SHA256="700324c6dd0ebea0117591c6cc9d7350d9c7c5c287acbad7630fa17b1d4d9e2f"
 HELM_VERSION="4.2.3"
 HELM_SHA256="e9b88b4ee95b18c706839c28d3a0220e5bc470e9cd9262410c90793c45ff8b7c"
 
@@ -106,6 +108,15 @@ xs_install_helm() {
   tgz="${dir}/helm.tgz"
   _xs_fetch "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz" "${HELM_SHA256}" "${tgz}"
   tar -xzf "${tgz}" -C "${dir}" --strip-components=1 linux-amd64/helm
+  rm -f "${tgz}"
+}
+
+xs_install_shellcheck() {
+  local dir tgz
+  dir="$(_xs_bindir)"
+  tgz="${dir}/shellcheck.tar.xz"
+  _xs_fetch "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" "${SHELLCHECK_SHA256}" "${tgz}"
+  tar -xJf "${tgz}" -C "${dir}" --strip-components=1 "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
   rm -f "${tgz}"
 }
 

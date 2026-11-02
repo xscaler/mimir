@@ -30,6 +30,8 @@ on:
   push:
     branches:
       - '**'
+      # Written by the xs-sync rehearsal with an App token; sync/<tag> pushes run in verify mode.
+      - '!rehearsal-sync/**'
     tags:
       - 'v*-xs.*'
   pull_request:

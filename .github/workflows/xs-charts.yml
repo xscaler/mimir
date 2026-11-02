@@ -25,13 +25,9 @@ on:
     branches:
       - main
       - 'ci/**'
-    paths:
-      - 'operations/helm/**'
-      - 'operations/mimir-mixin-compiled/**'
-      - 'operations/mimir-mixin-compiled-baremetal/**'
-      - 'docs/sources/helm-charts/**'
-      - '.github/workflows/xs-charts.yml'
-      - '.github/scripts/xs-*'
+      - 'sync/**' # a sync PR that moves the chart (same-repo PRs are skipped below)
+    # No paths filter on push: GitHub does not say how it treats a push that creates a branch,
+    # and a sync/<tag> branch is always new. The changes job applies the same path list.
   pull_request:
     branches:
       - main
@@ -55,9 +51,53 @@ env:
   CHART_NAME: mimir-distributed
 
 jobs:
+  changes:
+    # The path filter of the push trigger, done by hand. Pushes to sync/** always run the chart jobs;
+    # other pushes run when a file of the push (before..after) is a chart path or an xs-charts file,
+    # as the trigger filter did. An unknown before commit (new branch, force push) runs them.
+    name: changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.paths.outputs.run }}
+    steps:
+      - name: Check out repository
+        if: github.event_name == 'push' && !startsWith(github.ref, 'refs/heads/sync/')
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Decide
+        id: paths
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [[ "${EVENT_NAME}" == "push" && "${REF}" != refs/heads/sync/* ]]; then
+            run=unknown
+            if [[ "${BEFORE}" =~ ^[0-9a-f]{40}$ && ! "${BEFORE}" =~ ^0+$ ]] && git cat-file -e "${BEFORE}^{commit}" 2> /dev/null; then
+              run=false
+              while IFS= read -r -d '' f; do
+                case "${f}" in
+                  operations/helm/* | operations/mimir-mixin-compiled/* | operations/mimir-mixin-compiled-baremetal/* | docs/sources/helm-charts/* | .github/workflows/xs-charts.yml | .github/scripts/xs-*) run=true ;;
+                esac
+              done < <(git diff --name-only -z "${BEFORE}" "${AFTER}")
+            fi
+            [[ "${run}" != unknown ]] || run=true
+          fi
+          echo "run=${run}" >> "${GITHUB_OUTPUT}"
+          echo "run: ${run} (${EVENT_NAME} on ${REF})"
+
   verify:
+    needs: changes
     # Same-repo PRs are already covered by the push trigger on their branch.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    if: needs.changes.outputs.run == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

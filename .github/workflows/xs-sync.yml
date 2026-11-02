@@ -1,0 +1,537 @@
+# xScaler fork: keep main within one release of upstream.
+#
+# Live runs (schedule, or workflow_dispatch on main):
+#   mirror      push upstream branches (as upstream/<name>) and new upstream tags to
+#               origin. Never pushes main, never touches v*-xs.* tags.
+#   detect      current = highest upstream release tag in main's history, latest =
+#               highest stable upstream tag. Proceeds when latest is newer and no
+#               sync PR for it is open.
+#   sync        closes stale sync/* PRs, applies our patch set to the new tag and
+#               opens a PR from sync/<tag>. The merge commit is created through the
+#               git data API, so GitHub signs it (Verified) and no job pushes with
+#               git. A patch that does not apply opens a "sync: <tag> conflicts" issue.
+#   report      opens or updates a "sync: failed" issue when a job fails.
+#
+# Two layers. The engine layer is the new engine tag with our patch outside the chart
+# paths. The chart layer is the newest mimir-distributed release whose appVersion is the
+# new engine version plus our chart patch, with the chart version and xscaler.engineTag
+# bumped and the golden records regenerated with the upstream script (Helm, pinned like
+# the one in the upstream build image). When no chart release exists for the new engine
+# version the chart paths stay as they are and the PR body says so.
+#
+# Rehearsal runs (push to ci/**): the mirror prints what it would push, and the
+# sync logic runs against an artificial base (the previous engine release and the
+# previous chart release, each plus our patch, written to a dangling commit): the clean
+# and merge runs must reproduce this branch's tree exactly on a rehearsal-sync/ branch,
+# the conflict runs (engine and chart) must open an issue (labelled rehearsal, closed
+# afterwards) and no branch. All of them clean up after themselves.
+#
+# The logic lives in .github/scripts/xs-sync.sh. Its parameter block is the only
+# part that changes between repositories; this file is repository neutral.
+#
+# Upstream workflows: a sync brings new upstream workflow files, and GitHub may run
+# them once on the sync/<tag> branch push before the daily disable-upstream-workflows
+# job (which disables every active workflow that is not xs-*.yml) catches them. The
+# PR body lists every upstream .github path that changed so a reviewer sees them.
+#
+# An open sync PR is refreshed each day when main moved (rebuilt onto the new main
+# head) as long as its branch is still the bot's own commit; otherwise the PR gets
+# a comment asking for a manual update. A sync PR closed without merging is skipped. The
+# same refresh also catches a mimir-distributed release that appeared after the PR was built
+# (the rebuilt tree differs from the branch tip's tree).
+#
+# Chart-only catch-up: when the engine is current but a mimir-distributed release newer than
+# the chart main carries exists for the same engine version, detect opens sync/<chart tag>
+# (engine layer unchanged, chart layer moved).
+#
+# Sync PRs must be merged with a merge commit: main keeps the upstream tag in its
+# history, and detect, xs-release and the next sync all find the release through it.
+name: xs-sync
+
+on:
+  schedule:
+    - cron: "47 4 * * *"
+  workflow_dispatch: {}
+  push:
+    branches:
+      - "ci/**"
+
+permissions: {}
+
+concurrency:
+  group: xs-sync-${{ github.ref == 'refs/heads/main' && 'live' || format('rehearsal-{0}', github.ref_name) }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - name: Resolve mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          mode=none
+          if [[ ("${EVENT_NAME}" == "schedule" || "${EVENT_NAME}" == "workflow_dispatch") && "${REF}" == "refs/heads/main" ]]; then
+            mode=live
+          elif [[ ("${EVENT_NAME}" == "push" || "${EVENT_NAME}" == "workflow_dispatch") && "${REF}" == refs/heads/ci/* ]]; then
+            mode=rehearsal
+          fi
+          echo "mode=${mode}" >> "${GITHUB_OUTPUT}"
+          echo "mode: ${mode} (${EVENT_NAME} on ${REF})"
+
+  mirror:
+    name: mirror upstream
+    needs: plan
+    if: needs.plan.outputs.mode == 'live' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: automation # holds the App credentials (secrets.XS_AUTOMATION_APP_*); allows main and ci/**
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${REF}" == "refs/heads/main" && ("${EVENT_NAME}" == "schedule" || "${EVENT_NAME}" == "workflow_dispatch") ]] || {
+            echo "::error::live sync runs only from main on schedule or dispatch"
+            exit 1
+          }
+
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.XS_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.XS_AUTOMATION_APP_PRIVATE_KEY }}
+          owner: xscaler
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-workflows: write # upstream branches and tags carry workflow files
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Mirror
+        env:
+          XS_PUSH_TOKEN: ${{ steps.app.outputs.token }}
+        run: .github/scripts/xs-sync.sh mirror
+
+  disable-upstream-workflows:
+    name: disable upstream workflows
+    needs: plan
+    if: needs.plan.outputs.mode == 'live' && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    environment: automation # holds the App credentials (secrets.XS_AUTOMATION_APP_*); allows main and ci/**
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${REF}" == "refs/heads/main" && ("${EVENT_NAME}" == "schedule" || "${EVENT_NAME}" == "workflow_dispatch") ]] || {
+            echo "::error::live sync runs only from main on schedule or dispatch"
+            exit 1
+          }
+
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.XS_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.XS_AUTOMATION_APP_PRIVATE_KEY }}
+          owner: xscaler
+          repositories: ${{ github.event.repository.name }}
+          permission-actions: write # disable workflows
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Disable every active workflow that is not xs-*.yml
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: .github/scripts/xs-sync.sh disable-upstream-workflows
+
+  mirror-dry-run:
+    name: mirror dry run
+    needs: plan
+    if: needs.plan.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Print what would be pushed
+        run: .github/scripts/xs-sync.sh mirror --dry-run
+
+  detect:
+    name: detect new release
+    needs: [plan, mirror]
+    # Runs after a failed mirror too: detect reads origin's tags as they are, and a
+    # transient mirror failure must not stop a release that is already mirrored.
+    if: ${{ !cancelled() && needs.plan.outputs.mode == 'live' && (needs.mirror.result == 'success' || needs.mirror.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read # list open sync PRs
+    outputs:
+      current: ${{ steps.detect.outputs.current }}
+      latest: ${{ steps.detect.outputs.latest }}
+      proceed: ${{ steps.detect.outputs.proceed }}
+      open_pr: ${{ steps.detect.outputs.open_pr }}
+      supersede: ${{ steps.detect.outputs.supersede }}
+      chart_proceed: ${{ steps.detect.outputs.chart_proceed }}
+      chart_tag: ${{ steps.detect.outputs.chart_tag }}
+      chart_supersede: ${{ steps.detect.outputs.chart_supersede }}
+      chart_open_pr: ${{ steps.detect.outputs.chart_open_pr }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Detect
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          heads="${RUNNER_TEMP}/open-heads"
+          .github/scripts/xs-sync.sh open-heads "${heads}"
+          .github/scripts/xs-sync.sh detect --base origin/main --open-heads "${heads}"
+
+  regen:
+    # Upstream code (the chart, its build script, Helm and the chart dependencies) runs here,
+    # in a job that never holds the App token. The regenerated golden records go to the sync
+    # job as an artifact, which is data only: the sync job validates it before use.
+    name: regenerate golden records
+    needs: [plan, detect]
+    if: needs.plan.outputs.mode == 'live' && github.ref == 'refs/heads/main' && (needs.detect.outputs.proceed == 'true' || needs.detect.outputs.chart_proceed == 'true' || needs.detect.outputs.open_pr == 'true' || needs.detect.outputs.chart_open_pr == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read # the closed-PR check, in a step of its own
+    outputs:
+      goldens: ${{ steps.goldens.outputs.goldens }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Install Helm
+        run: |
+          set -euo pipefail
+          source .github/scripts/xs-lib.sh
+          xs_install_helm
+
+      - name: Select the head this run builds
+        id: head
+        env:
+          CURRENT: ${{ needs.detect.outputs.current }}
+          LATEST: ${{ needs.detect.outputs.latest }}
+          PROCEED: ${{ needs.detect.outputs.proceed }}
+          CHART_PROCEED: ${{ needs.detect.outputs.chart_proceed }}
+          CHART_TAG: ${{ needs.detect.outputs.chart_tag }}
+          OPEN_PR: ${{ needs.detect.outputs.open_pr }}
+          CHART_OPEN_PR: ${{ needs.detect.outputs.chart_open_pr }}
+        run: |
+          set -euo pipefail
+          .github/scripts/xs-sync.sh sync-run --head-only --current "${CURRENT}" --latest "${LATEST}" \
+            --proceed "${PROCEED}" --open-pr "${OPEN_PR}" --chart-proceed "${CHART_PROCEED}" --chart-open-pr "${CHART_OPEN_PR}" --chart-tag "${CHART_TAG}"
+
+      # A closed, unmerged sync PR is a deliberate skip: do not regenerate for it every day. The
+      # read-only token lives in this step only, never in the one that runs upstream code.
+      - name: Check for a closed sync PR
+        id: closed
+        if: steps.head.outputs.head != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HEAD: ${{ steps.head.outputs.head }}
+        run: .github/scripts/xs-sync.sh closed-skip "${HEAD}"
+
+      - name: Regenerate
+        id: regen
+        if: steps.head.outputs.head != '' && steps.closed.outputs.skip != 'true'
+        env:
+          CURRENT: ${{ needs.detect.outputs.current }}
+          LATEST: ${{ needs.detect.outputs.latest }}
+          PROCEED: ${{ needs.detect.outputs.proceed }}
+          CHART_PROCEED: ${{ needs.detect.outputs.chart_proceed }}
+          CHART_TAG: ${{ needs.detect.outputs.chart_tag }}
+          OPEN_PR: ${{ needs.detect.outputs.open_pr }}
+          CHART_OPEN_PR: ${{ needs.detect.outputs.chart_open_pr }}
+        run: |
+          set -euo pipefail
+          base_commit="$(git rev-parse origin/main)"
+          base_tree="$(git rev-parse "origin/main^{tree}")"
+          .github/scripts/xs-sync.sh sync-run --current "${CURRENT}" --latest "${LATEST}" \
+            --proceed "${PROCEED}" --open-pr "${OPEN_PR}" --chart-proceed "${CHART_PROCEED}" --chart-open-pr "${CHART_OPEN_PR}" --chart-tag "${CHART_TAG}" \
+            --base-commit "${base_commit}" --base-tree "${base_tree}" \
+            --goldens-out "${RUNNER_TEMP}/goldens"
+
+      # Decided here from the presence of the output directory, not from anything the step that
+      # ran upstream code could write.
+      - name: Decide whether there are records to hand over
+        id: goldens
+        run: |
+          set -euo pipefail
+          if [[ -d "${RUNNER_TEMP}/goldens" ]]; then echo "goldens=true" >> "${GITHUB_OUTPUT}"; else echo "goldens=false" >> "${GITHUB_OUTPUT}"; fi
+
+      - name: Upload the golden records
+        if: steps.goldens.outputs.goldens == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: goldens-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/goldens
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  sync:
+    name: build sync PR
+    needs: [plan, detect, regen]
+    if: ${{ !cancelled() && needs.plan.outputs.mode == 'live' && github.ref == 'refs/heads/main' && (needs.detect.outputs.proceed == 'true' || needs.detect.outputs.supersede != '' || needs.detect.outputs.chart_proceed == 'true' || needs.detect.outputs.chart_supersede != '' || needs.detect.outputs.open_pr == 'true' || needs.detect.outputs.chart_open_pr == 'true') && needs.regen.result != 'failure' }}
+    runs-on: ubuntu-latest
+    environment: automation # holds the App credentials (secrets.XS_AUTOMATION_APP_*); allows main and ci/**
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [[ "${REF}" == "refs/heads/main" && ("${EVENT_NAME}" == "schedule" || "${EVENT_NAME}" == "workflow_dispatch") ]] || {
+            echo "::error::live sync runs only from main on schedule or dispatch"
+            exit 1
+          }
+
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.XS_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.XS_AUTOMATION_APP_PRIVATE_KEY }}
+          owner: xscaler
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write # sync/* branch and merge commit
+          permission-workflows: write # the patch set carries workflow files
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Download the golden records
+        if: needs.regen.outputs.goldens == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: goldens-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/goldens
+
+      - name: Close superseded sync PRs
+        if: needs.detect.outputs.supersede != '' || needs.detect.outputs.chart_supersede != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          LATEST: ${{ needs.detect.outputs.latest }}
+          CHART_TAG: ${{ needs.detect.outputs.chart_tag }}
+          SUPERSEDE: ${{ needs.detect.outputs.supersede }}
+          CHART_SUPERSEDE: ${{ needs.detect.outputs.chart_supersede }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SUPERSEDE}" ]]; then
+            read -r -a heads <<<"${SUPERSEDE}"
+            .github/scripts/xs-sync.sh supersede "${LATEST}" "${heads[@]}"
+          fi
+          if [[ -n "${CHART_SUPERSEDE}" ]]; then
+            # Older chart-only PRs are superseded by the newer chart release, or by the engine
+            # release that carries the chart layer when no chart-only sync is pending.
+            read -r -a cheads <<<"${CHART_SUPERSEDE}"
+            .github/scripts/xs-sync.sh supersede "${CHART_TAG:-${LATEST}}" "${cheads[@]}"
+          fi
+
+      - name: Build and open the sync PR
+        if: needs.detect.outputs.proceed == 'true' || needs.detect.outputs.chart_proceed == 'true' || needs.detect.outputs.open_pr == 'true' || needs.detect.outputs.chart_open_pr == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          CURRENT: ${{ needs.detect.outputs.current }}
+          LATEST: ${{ needs.detect.outputs.latest }}
+          PROCEED: ${{ needs.detect.outputs.proceed }}
+          CHART_PROCEED: ${{ needs.detect.outputs.chart_proceed }}
+          CHART_TAG: ${{ needs.detect.outputs.chart_tag }}
+          OPEN_PR: ${{ needs.detect.outputs.open_pr }}
+          CHART_OPEN_PR: ${{ needs.detect.outputs.chart_open_pr }}
+        run: |
+          set -euo pipefail
+          base_commit="$(git rev-parse origin/main)"
+          base_tree="$(git rev-parse "origin/main^{tree}")"
+          goldens=()
+          if [[ -d "${RUNNER_TEMP}/goldens" ]]; then goldens=(--goldens "${RUNNER_TEMP}/goldens"); fi
+          .github/scripts/xs-sync.sh sync-run --current "${CURRENT}" --latest "${LATEST}" \
+            --proceed "${PROCEED}" --open-pr "${OPEN_PR}" --chart-proceed "${CHART_PROCEED}" --chart-open-pr "${CHART_OPEN_PR}" --chart-tag "${CHART_TAG}" \
+            --base-commit "${base_commit}" --base-tree "${base_tree}" "${goldens[@]}"
+
+  rehearsal-prepare:
+    # The token-less half of the rehearsal: builds the artificial base and the sync result
+    # locally and regenerates the golden records with Helm. The rehearsal job below has the
+    # App token and takes the records from here.
+    name: rehearsal prepare ${{ matrix.kind }}
+    needs: plan
+    if: needs.plan.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [clean, merge, conflict, chart-merge, chart-conflict]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Install Helm
+        run: |
+          set -euo pipefail
+          source .github/scripts/xs-lib.sh
+          xs_install_helm
+
+      - name: Regenerate
+        env:
+          KIND: ${{ matrix.kind }}
+        run: .github/scripts/xs-sync.sh rehearse "${KIND}" --goldens-out "${RUNNER_TEMP}/goldens"
+
+      - name: Upload the golden records
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: goldens-${{ matrix.kind }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/goldens
+          include-hidden-files: true
+          if-no-files-found: ignore # the conflict kinds regenerate nothing
+          retention-days: 1
+
+  rehearsal:
+    name: rehearsal ${{ matrix.kind }}
+    needs: [plan, rehearsal-prepare]
+    if: needs.plan.outputs.mode == 'rehearsal'
+    runs-on: ubuntu-latest
+    environment: automation # holds the App credentials (secrets.XS_AUTOMATION_APP_*); allows main and ci/**
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        kind: [clean, merge, conflict, chart-merge, chart-conflict]
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.XS_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.XS_AUTOMATION_APP_PRIVATE_KEY }}
+          owner: xscaler
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write # rehearsal-sync/* branch
+          permission-workflows: write
+          permission-issues: write # conflict issue, labelled rehearsal
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Download the golden records
+        continue-on-error: true # the conflict kinds have none
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: goldens-${{ matrix.kind }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/goldens
+
+      - name: Rehearse
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          goldens=()
+          if [[ -d "${RUNNER_TEMP}/goldens" ]]; then goldens=(--goldens "${RUNNER_TEMP}/goldens"); fi
+          .github/scripts/xs-sync.sh rehearse "${KIND}" "${goldens[@]}"
+
+  report:
+    name: report failure
+    needs: [plan, disable-upstream-workflows, mirror, detect, regen, sync]
+    if: failure() && needs.plan.outputs.mode == 'live'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write # failure issue
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Open or update the failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: .github/scripts/xs-sync.sh issue-failed "${RUN_URL}"

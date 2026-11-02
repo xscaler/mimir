@@ -25,6 +25,10 @@ on:
   push:
     branches:
       - '**'
+      # Written by the xs-sync rehearsal with an App token, which (unlike GITHUB_TOKEN)
+      # triggers workflows; nothing to test there. sync/<tag> pushes do run: same-repo
+      # PRs are skipped below, so the push is the run that covers a sync PR.
+      - '!rehearsal-sync/**'
   workflow_dispatch:
   schedule:
     - cron: '17 4 * * 1'
