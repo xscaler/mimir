@@ -297,6 +297,128 @@ G update-ref refs/remotes/origin/main "$(G rev-parse main)"
 in_repo "${repo}" cmd_check parents v1.0.3 s3old
 expect "parents stale main" "1" "${RC}"
 
+# ---------------------------------------------------------------------------
+# xs namespace: upstream never owns it, a sync result never changes it
+# ---------------------------------------------------------------------------
+ns_yes() { if xs_ns_path "$1"; then echo yes; else echo no; fi; }
+expect "ns workflow" "yes" "$(ns_yes .github/workflows/xs-evil.yml)"
+expect "ns script" "yes" "$(ns_yes .github/scripts/xs-x.sh)"
+expect "ns nested" "yes" "$(ns_yes .github/scripts/xs-x/y.sh)"
+expect "ns upstream workflow" "no" "$(ns_yes .github/workflows/ci.yml)"
+expect "ns lookalike" "no" "$(ns_yes .github/workflows/not-xs-x.yml)"
+expect "ns outside .github" "no" "$(ns_yes docs/xs-x.md)"
+expect "ns chart path is not namespace" "no" "$(ns_yes operations/helm/charts/mimir-distributed/values.yaml)"
+
+repo="${scratch}/ns"
+git init -q -b main "${repo}"
+printf 'one\ntwo\nthree\n' > "${repo}/a.txt"
+mkdir -p "${repo}/.github/workflows"
+echo ci > "${repo}/.github/workflows/ci.yml"
+G add -A && G commit -q -m base && G tag v1.0.0
+base_tag_commit="$(G rev-parse HEAD)"
+echo ours > "${repo}/.github/workflows/xs-x.yml"
+G add -A && G commit -q -m patch
+main_tree="$(G rev-parse 'HEAD^{tree}')"
+G update-ref refs/heads/mainline HEAD
+# v1.0.1: upstream adds an xs-* workflow of its own
+G checkout -q -b u1 "${base_tag_commit}"
+echo evil > "${repo}/.github/workflows/xs-evil.yml"
+printf 'one\ntwo\nthree\nfour\n' > "${repo}/a.txt"
+G add -A && G commit -q -m u1 && G tag v1.0.1
+# v1.0.2: upstream rewrites one of our files (path matches xs-*)
+G checkout -q -b u2 "${base_tag_commit}"
+echo theirs > "${repo}/.github/workflows/xs-x.yml"
+G add -A && G commit -q -m u2 && G tag v1.0.2
+# v1.0.3: a clean upstream release
+G checkout -q -b u3 "${base_tag_commit}"
+printf 'one\ntwo\nthree\nfive\n' > "${repo}/a.txt"
+G add -A && G commit -q -m u3 && G tag v1.0.3
+# result = v1.0.3 plus our patch
+result_tree() { # <tag> <xs-x content>
+  G checkout -q --detach "$1"
+  echo "$2" > "${repo}/.github/workflows/xs-x.yml"
+  G add -A && G commit -q -m result
+  G rev-parse 'HEAD^{tree}'
+}
+in_repo "${repo}" xs_ns_violations v1.0.3 "${main_tree}" "$(result_tree v1.0.3 ours)"
+expect "ns clean sync" "0 " "${RC} ${OUT}"
+in_repo "${repo}" xs_ns_violations v1.0.1
+expect "ns upstream adds xs file" "0 upstream v1.0.1 contains .github/workflows/xs-evil.yml" "${RC} ${OUT}"
+in_repo "${repo}" xs_ns_violations v1.0.2
+expect "ns upstream owns one of ours" "0 upstream v1.0.2 contains .github/workflows/xs-x.yml" "${RC} ${OUT}"
+in_repo "${repo}" xs_ns_violations v1.0.3 "${main_tree}" "$(result_tree v1.0.3 changed)"
+expect "ns result differs from main" "0 result differs from main at .github/workflows/xs-x.yml" "${RC} ${OUT}"
+in_repo "${repo}" xs_ns_violations no-such-ref
+expect "ns git failure is an error" "1" "${RC}"
+# a path with a newline cannot forge a log line
+G checkout -q --detach v1.0.3
+printf 'x\n' > "${repo}/.github/workflows/xs-$(printf 'a\nb').yml"
+G add -A && G commit -q -m nl && G tag v1.0.4
+in_repo "${repo}" xs_ns_violations v1.0.4
+expect "ns path is sanitised" "1" "$(grep -c '' <<<"${OUT}")"
+G checkout -q main
+
+# identity check: a tag that holds xs files fails, even when the result keeps them
+G checkout -q -b idns v1.0.1
+echo ours > "${repo}/.github/workflows/xs-x.yml"; G add -A && G commit -q -m ours
+in_repo "${repo}" cmd_check identity v1.0.1 idns
+expect "identity rejects upstream xs path" "1 yes" "${RC} $(grep -q 'xs-evil.yml' <<<"${OUT}" && echo yes || echo no)"
+G checkout -q -b idns3 v1.0.3
+echo ours > "${repo}/.github/workflows/xs-x.yml"; G add -A && G commit -q -m ours
+in_repo "${repo}" cmd_check identity v1.0.3 idns3
+expect "identity accepts a clean tag" "0" "${RC}"
+G checkout -q main
+
+# workflows to disable: an xs-* workflow upstream also has is not ours
+wfl="$(printf '1\t.github/workflows/xs-x.yml\tactive\n2\t.github/workflows/xs-evil.yml\tactive\n3\t.github/workflows/ci.yml\tactive\n')"
+wf_with() { (cd "${repo}" && XS_UPSTREAM_REFS="$1" xs_workflows_to_disable <<<"${wfl}" | cut -f1 | tr '\n' ' '); }
+expect "disable: no upstream refs" "3 " "$(wf_with '')"
+expect "disable: upstream tag with xs file" "2 3 " "$(wf_with 'v1.0.1')"
+expect "disable: clean upstream tag" "3 " "$(wf_with 'v1.0.3')"
+expect "disable: upstream owns one of ours" "1 3 " "$(wf_with 'v1.0.2')"
+expect "disable: any ref counts" "2 3 " "$(wf_with 'v1.0.3 v1.0.1')"
+
+# mirror: upstream main (or a new tag) with xs paths is mirrored, but fails the run
+mirror_check() { # <upstream main branch dir content tag> -> rc
+  local mrepo="${scratch}/mirror-$1"
+  git init -q --bare -b main "${mrepo}"
+  git -C "${mrepo}" fetch -q "${repo}" "refs/tags/$1:refs/heads/main"
+  local clone="${scratch}/mirror-clone-$1"
+  git init -q -b work "${clone}"
+  git -C "${clone}" remote add "${XS_UPSTREAM_REMOTE}" "${mrepo}"
+  (cd "${clone}" && XS_RETRY_SLEEP=0 mirror_ns_check "${@:2}") 2>&1
+  echo "rc=$?"
+}
+out="$(mirror_check v1.0.1)"
+expect "mirror check: upstream main with xs path" "yes 1" "$(grep -q 'xs-evil.yml' <<<"${out}" && echo yes) $(grep -c '^rc=1' <<<"${out}")"
+out="$(mirror_check v1.0.3)"
+expect "mirror check: clean upstream main" "rc=0" "$(grep '^rc=' <<<"${out}")"
+# a new tag with xs paths fails too
+clone="${scratch}/mirror-clone-v1.0.3"
+git -C "${clone}" fetch -q --no-tags "${scratch}/ns" refs/tags/v1.0.1:refs/tags/v1.0.1
+out="$(cd "${clone}" && XS_RETRY_SLEEP=0 mirror_ns_check refs/tags/v1.0.1 2>&1; echo "rc=$?")"
+expect "mirror check: new tag with xs path" "yes 1" "$(grep -q 'tags/v1.0.1' <<<"${out}" && echo yes) $(grep -c '^rc=1' <<<"${out}")"
+
+# issue lookups only trust issues of the bot, with our label
+calls="${scratch}/gh-calls"
+gh() { printf '%s\n' "$*" >> "${calls}"; }
+: > "${calls}"
+issue_find "sync: v1.0.1 conflicts" sync-conflict > /dev/null
+expect "issue_find author and label" "yes yes" "$(grep -q -e '--author app/xscaler-gremlin' "${calls}" && echo yes) $(grep -q -e '--label sync-conflict' "${calls}" && echo yes)"
+: > "${calls}"
+issue_find "sync: failed" sync-failed "${XS_ISSUE_AUTHOR_ACTIONS}" > /dev/null
+expect "issue_find failure issue author" "yes" "$(grep -q -e '--author app/github-actions' "${calls}" && echo yes)"
+in_repo "${repo}" issue_find "sync: x" ""
+expect "issue_find needs a label" "1" "${RC}"
+: > "${calls}"
+cmd_issue_failed https://github.com/xscaler/loki/actions/runs/1 > /dev/null 2>&1
+expect "issue-failed looks up with the Actions author" "yes yes" "$(grep -q -e '--author app/github-actions' "${calls}" && echo yes) $(grep -q -e '--label sync-failed' "${calls}" && echo yes)"
+: > "${calls}"
+rehearsal_cleanup > /dev/null 2>&1
+REHEARSAL_TITLE="rehearsal sync: x" rehearsal_cleanup > /dev/null 2>&1
+expect "rehearsal cleanup looks up by author and label" "yes yes" "$(grep -q -e '--author app/xscaler-gremlin' "${calls}" && echo yes) $(grep -q -e '--label rehearsal' "${calls}" && echo yes)"
+unset -f gh
+
 # api_plan: modify, delete, rename, mode change, symlink, binary.
 repo="${scratch}/plan"
 git init -q -b main "${repo}"
