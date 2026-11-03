@@ -453,11 +453,14 @@ xs_workflows_to_disable() {
 # under .github that differs between the two upstream bases and is not ours.
 xs_github_changes() {
   local st p
+  local gl
+  gl="$(mktemp)"
+  git diff --no-renames --name-status -z "$1" "$2" -- .github > "${gl}" || die "${FUNCNAME[0]}: git failed"
   while IFS= read -r -d '' st && IFS= read -r -d '' p; do
     if xs_path_allowed "${p}"; then continue; fi
     case "${st}" in A) st=added ;; D) st=deleted ;; *) st=modified ;; esac
     printf '%s %s\n' "${st}" "${p}"
-  done < <(git diff --no-renames --name-status -z "$1" "$2" -- .github)
+  done < "${gl}"
 }
 
 # xs_own_heads: stdin is `gh pr list --json headRefName,isCrossRepository`.
@@ -497,9 +500,12 @@ xs_md_paths() {
 # tag's content.
 xs_content_matches() {
   local p
+  local gl
+  gl="$(mktemp)"
+  git diff --no-renames --name-only -z "$1" "$2" -- . "${XS_CHART_EXCLUDES[@]}" > "${gl}" || die "${FUNCNAME[0]}: git failed"
   while IFS= read -r -d '' p; do
     xs_path_allowed "${p}" || return 1
-  done < <(git diff --no-renames --name-only -z "$1" "$2" -- . "${XS_CHART_EXCLUDES[@]}")
+  done < "${gl}"
   return 0
 }
 
@@ -812,6 +818,9 @@ api_call() {
 api_plan() {
   local base="$1" result="$2" meta path omode nmode osha nsha status blob
   local -a deleted=() added=()
+  local gl
+  gl="$(mktemp)"
+  git diff-tree -r -z --no-renames --raw "${base}" "${result}" > "${gl}" || die "${FUNCNAME[0]}: git failed"
   while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
     read -r omode nmode osha nsha status <<<"${meta#:}"
     case "${status}" in
@@ -834,7 +843,7 @@ api_plan() {
         ;;
       *) die "unexpected diff status ${status} at ${path}" ;;
     esac
-  done < <(git diff-tree -r -z --no-renames --raw "${base}" "${result}")
+  done < "${gl}"
 
   # A path that turns from file to directory or back cannot go through one
   # tree request with a base tree.
@@ -1096,11 +1105,14 @@ chart_enabled() { ((${#XS_CHART_PATHS[@]} > 0)); }
 # the engine version (empty when there is none).
 chart_lines() {
   local t app
+  local gl
+  gl="$(mktemp)"
+  git tag --list > "${gl}" || die "${FUNCNAME[0]}: git failed"
   while IFS= read -r t; do
     xs_chart_version_of "${t}" > /dev/null || continue
     app="$(git show "refs/tags/${t}:${XS_CHART_FILE}" 2> /dev/null | xs_chart_app_version || true)"
     printf '%s %s\n' "${t}" "${app}"
-  done < <(git tag --list)
+  done < "${gl}"
 }
 chart_tag_for() { chart_lines | xs_chart_pick "$1"; }
 
@@ -1732,6 +1744,9 @@ rehearsal_file() {
   shift 3
   local -a specs=("$@")
   if ((${#specs[@]} == 0)); then specs=(. ':!.github' "${XS_CHART_EXCLUDES[@]}"); fi
+  local gl
+  gl="$(mktemp)"
+  git diff --no-renames --name-only -z --diff-filter=M "${base}" "${target}" -- "${specs[@]}" > "${gl}" || die "${FUNCNAME[0]}: git failed"
   while IFS= read -r -d '' f; do
     git cat-file -e "${base}:${f}" 2> /dev/null || continue
     # A file with a merge attribute (mimir merges CHANGELOGs as union) never conflicts.
@@ -1745,7 +1760,7 @@ rehearsal_file() {
     fi
     printf '%s\n' "${f}"
     return 0
-  done < <(git diff --no-renames --name-only -z --diff-filter=M "${base}" "${target}" -- "${specs[@]}")
+  done < "${gl}"
   return 1
 }
 
@@ -1964,13 +1979,16 @@ cmd_check() {
         local ctag cn=0 cbad=0
         ctag="$(chart_current_tag "${head}")" || die "${XS_CHART_FILE} at ${head} has no <version>+xs.<n> chart version"
         git rev-parse --verify --quiet "refs/tags/${ctag}^{commit}" > /dev/null || die "chart tag ${ctag} is missing"
+        local gl
+        gl="$(mktemp)"
+        git diff --no-renames --name-only -z "refs/tags/${ctag}" "${head}" -- "${XS_CHART_PATHS[@]}" > "${gl}" || die "${FUNCNAME[0]}: git failed"
         while IFS= read -r -d '' p; do
           cn=$((cn + 1))
           if ! xs_chart_path_allowed "${p}"; then
             echo "::error::${p} differs from ${ctag} and is not a chart patch path"
             cbad=$((cbad + 1))
           fi
-        done < <(git diff --no-renames --name-only -z "refs/tags/${ctag}" "${head}" -- "${XS_CHART_PATHS[@]}")
+        done < "${gl}"
         ((cbad == 0)) || die "${cbad} chart path(s) outside the chart patch set differ from ${ctag}"
         echo "chart identity OK: ${cn} path(s) differ from ${ctag}, all inside the chart patch set"
         summary "chart identity: ${cn} path(s) differ from ${ctag}, all inside the chart patch set"
@@ -1992,12 +2010,15 @@ cmd_check() {
       git merge-base --is-ancestor "${tag_commit}" "${head}" || die "${tag} is not an ancestor of ${head}"
       local t v tv
       tv="$(xs_version_of "${tag}")"
+      local gl
+      gl="$(mktemp)"
+      git tag --list > "${gl}" || die "${FUNCNAME[0]}: git failed"
       while IFS= read -r t; do
         v="$(xs_version_of "${t}")" || continue
         if xs_ver_gt "${v}" "${tv}" && git merge-base --is-ancestor "${t}" "${head}"; then
           die "newer upstream release ${t} is an ancestor of ${head}"
         fi
-      done < <(git tag --list)
+      done < "${gl}"
       echo "version OK: ${tag} is the newest upstream release in ${head}'s history"
       ;;
     *) die "unknown check ${what}" ;;
