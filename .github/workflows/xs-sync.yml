@@ -31,7 +31,7 @@
 #
 # Upstream workflows: a sync brings new upstream workflow files, and GitHub may run
 # them once on the sync/<tag> branch push before the daily disable-upstream-workflows
-# job (which disables every active workflow that is not xs-*.yml) catches them. The
+# job (which disables every active workflow that is not ours) catches them. The
 # PR body lists every upstream .github path that changed so a reviewer sees them.
 #
 # An open sync PR is refreshed each day when main moved (rebuilt onto the new main
@@ -43,6 +43,11 @@
 # Chart-only catch-up: when the engine is current but a mimir-distributed release newer than
 # the chart main carries exists for the same engine version, detect opens sync/<chart tag>
 # (engine layer unchanged, chart layer moved).
+#
+# Namespace: upstream never owns xs-* workflows, scripts or actions. build fails when a
+# new tag carries such a path or the result would change main's; the mirror still copies
+# upstream refs but fails the run when upstream main or a new tag holds one; an xs-*
+# workflow that upstream main or the base tag also has is disabled like any upstream one.
 #
 # Sync PRs must be merged with a merge commit: main keeps the upstream tag in its
 # history, and detect, xs-release and the next sync all find the release through it.
@@ -164,9 +169,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0 # upstream/main and the base release tag decide which xs-* workflows are ours
+          fetch-tags: true
           persist-credentials: false
 
-      - name: Disable every active workflow that is not xs-*.yml
+      - name: Disable every active workflow that is not ours
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           GH_REPO: ${{ github.repository }}
