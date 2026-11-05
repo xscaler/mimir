@@ -292,6 +292,13 @@ func (a *API) RegisterRuntimeConfig(runtimeConfigHandler http.HandlerFunc, userL
 	})
 
 	a.RegisterRoute("/runtime_config", runtimeConfigHandler, false, true, "GET")
+	if userLimitsHandler != nil {
+		a.RegisterUserLimits(userLimitsHandler)
+	}
+}
+
+// RegisterUserLimits registers the endpoint that returns the limits of the calling tenant.
+func (a *API) RegisterUserLimits(userLimitsHandler http.HandlerFunc) {
 	a.RegisterRoute("/api/v1/user_limits", userLimitsHandler, true, true, "GET")
 }
 
