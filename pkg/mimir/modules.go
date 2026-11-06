@@ -9,6 +9,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"slices"
 	"strconv"
 	"time"
@@ -95,6 +96,8 @@ const (
 	API                              string = "api"
 	ActiveGroupsCleanupService       string = "active-groups-cleanup-service"
 	ActivityTracker                  string = "activity-tracker"
+	AdminStore                       string = "admin-store"
+	AdminStoreReady                  string = "admin-store-ready"
 	AlertManager                     string = "alertmanager"
 	BlockBuilder                     string = "block-builder"
 	BlockBuilderScheduler            string = "block-builder-scheduler"
@@ -463,7 +466,12 @@ func (t *Mimir) initRuntimeConfig() (services.Service, error) {
 	t.TenantLimits = newTenantLimits(serv)
 
 	t.RuntimeConfig = serv
-	t.API.RegisterRuntimeConfig(runtimeConfigHandler(t.RuntimeConfig, t.Cfg.LimitsConfig), validation.UserLimitsHandler(t.Cfg.LimitsConfig, t.TenantLimits))
+	// With the admin store enabled, it registers /api/v1/user_limits with the limits it enforces.
+	var userLimitsHandler http.HandlerFunc
+	if !t.Cfg.AdminStore.Enabled {
+		userLimitsHandler = validation.UserLimitsHandler(t.Cfg.LimitsConfig, t.TenantLimits)
+	}
+	t.API.RegisterRuntimeConfig(runtimeConfigHandler(t.RuntimeConfig, t.Cfg.LimitsConfig), userLimitsHandler)
 
 	// Update config fields using runtime config. Only if multiKV is used for given ring these returned functions will be
 	// called and register the listener.
@@ -1662,6 +1670,8 @@ func (t *Mimir) setupModuleManager() error {
 	mm.RegisterModule(API, t.initAPI, modules.UserInvisibleModule)
 	mm.RegisterModule(ActiveGroupsCleanupService, t.initActiveGroupsCleanupService, modules.UserInvisibleModule)
 	mm.RegisterModule(ActivityTracker, t.initActivityTracker, modules.UserInvisibleModule)
+	mm.RegisterModule(AdminStore, t.initAdminStore, modules.UserInvisibleModule)
+	mm.RegisterModule(AdminStoreReady, t.initAdminStoreReady, modules.UserInvisibleModule)
 	mm.RegisterModule(AlertManager, t.initAlertManager)
 	mm.RegisterModule(BlockBuilder, t.initBlockBuilder)
 	mm.RegisterModule(BlockBuilderScheduler, t.initBlockBuilderScheduler)
@@ -1729,11 +1739,13 @@ func (t *Mimir) setupModuleManager() error {
 	deps := map[string][]string{
 		//lint:sorted
 		API:                              {Server, ActivityTracker},
+		AdminStore:                       {API, RuntimeConfig},
+		AdminStoreReady:                  {AdminStore},
 		AlertManager:                     {API, MemberlistKV, Overrides, Vault},
 		BlockBuilder:                     {API, Overrides},
 		BlockBuilderScheduler:            {API},
 		CacheKeyGenerator:                {QueryFrontendCodec},
-		Compactor:                        {API, MemberlistKV, Overrides, Vault},
+		Compactor:                        {API, MemberlistKV, Overrides, AdminStoreReady, Vault},
 		CompactorScheduler:               {API},
 		ContinuousTest:                   {API},
 		CostAttributionService:           {API, Overrides},
@@ -1744,7 +1756,7 @@ func (t *Mimir) setupModuleManager() error {
 		IngesterRing:                     {API, RuntimeConfig, MemberlistKV, Vault},
 		IngesterService:                  {IngesterRing, IngesterPartitionRing, Overrides, RuntimeConfig, MemberlistKV, CostAttributionService},
 		MemberlistKV:                     {API, Vault},
-		Overrides:                        {RuntimeConfig},
+		Overrides:                        {RuntimeConfig, AdminStore},
 		OverridesExporter:                {Overrides, MemberlistKV, Vault},
 		Querier:                          {TenantFederation, Vault, QuerierLifecycler},
 		QuerierLifecycler:                {API, RuntimeConfig, MemberlistKV, Vault},

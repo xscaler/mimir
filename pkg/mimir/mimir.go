@@ -138,6 +138,7 @@ type Config struct {
 	ActivityTracker                activitytracker.Config          `yaml:"activity_tracker"`
 	IncludeTenantIDInProfileLabels bool                            `yaml:"include_tenant_id_in_profile_labels" category:"experimental"`
 	Vault                          vault.Config                    `yaml:"vault"`
+	AdminStore                     AdminStoreConfig                `yaml:"xscaler_admin_store" doc:"hidden"`
 
 	Ruler               ruler.Config                               `yaml:"ruler"`
 	RulerStorage        rulestore.Config                           `yaml:"ruler_storage"`
@@ -215,6 +216,7 @@ func (c *Config) RegisterFlags(f *flag.FlagSet, logger log.Logger) {
 	c.Ruler.RegisterFlags(f, logger)
 	c.RulerStorage.RegisterFlags(f)
 	c.Vault.RegisterFlags(f)
+	c.AdminStore.RegisterFlags(f)
 	c.Alertmanager.RegisterFlags(f, logger)
 	c.AlertmanagerStorage.RegisterFlags(f)
 	c.RuntimeConfig.RegisterFlags(f)
@@ -413,6 +415,9 @@ func (c *Config) Validate(log log.Logger) error {
 	}
 	if err := c.Vault.Validate(); err != nil {
 		return errors.Wrap(err, "invalid vault config")
+	}
+	if err := c.AdminStore.Validate(); err != nil {
+		return errors.Wrap(err, "invalid xscaler admin store config")
 	}
 	if c.isAlertManagerEnabled() {
 		if err := c.Alertmanager.Validate(); err != nil {
@@ -943,6 +948,7 @@ type Mimir struct {
 	IngesterPartitionRingWatchers  *ring.PartitionRingWatchers
 	IngesterPartitionInstanceRings *ring.PartitionInstanceRings
 	TenantLimits                   validation.TenantLimits
+	AdminStore                     *adminStore
 	Overrides                      *validation.Overrides
 	QueryLimitsProvider            streamingpromql.QueryLimitsProvider
 	ActiveGroupsCleanup            *util.ActiveGroupsCleanupService

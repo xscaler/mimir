@@ -113,11 +113,12 @@ xs_ver_gt 2.9.20 3.0.0 && r=yes || r=no
 expect "gt major" "no" "${r}"
 
 # patch path rules
-for p in .github/workflows/xs-test.yml .github/scripts/xs-sync.sh; do
+for p in .github/workflows/xs-test.yml .github/scripts/xs-sync.sh go.mod go.sum vendor/modules.txt \
+  pkg/mimir/admin_store.go pkg/mimir/modules.go pkg/api/api.go vendor/github.com/xscaler/dskit/xstenant/reader.go; do
   xs_path_allowed "${p}" && r=yes || r=no
   expect "allowed ${p}" "yes" "${r}"
 done
-for p in .github/workflows/check.yml .github/scripts/other.sh pkg/distributor/distributor.go go.mod; do
+for p in .github/workflows/check.yml .github/scripts/other.sh pkg/distributor/distributor.go pkg/mimir/config.go vendor/github.com/other/x.go vendor/github.com/grafana/dskit/x.go; do
   xs_path_allowed "${p}" && r=yes || r=no
   expect "not allowed ${p}" "no" "${r}"
 done
