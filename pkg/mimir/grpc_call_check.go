@@ -95,7 +95,13 @@ func (g *grpcInflightMethodLimiter) RPCCallStarting(ctx context.Context, methodN
 				return ctx, errNoDistributor
 			}
 
-			ctx, err := dist.StartPushRequest(ctx, getMessageSize(md, grpcutil.MetadataMessageSize))
+			// Deny a gated tenant before it takes an inflight slot.
+			ctx, err := gatePush(ctx, dist, md)
+			if err != nil {
+				return ctx, err
+			}
+
+			ctx, err = dist.StartPushRequest(ctx, getMessageSize(md, grpcutil.MetadataMessageSize))
 			if err != nil {
 				return ctx, status.Error(codes.Unavailable, err.Error())
 			}

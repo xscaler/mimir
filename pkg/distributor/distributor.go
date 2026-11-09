@@ -318,6 +318,9 @@ type Config struct {
 	// These functions will only receive samples that don't get dropped by HA deduplication.
 	PushWrappers []PushWrapper `yaml:"-"`
 
+	// PushGate, when set, denies the pushes of tenants before any other processing.
+	PushGate PushGate `yaml:"-"`
+
 	// OTLPPushMiddlewares are wrappers that are called when an OTLP push request is received.
 	OTLPPushMiddlewares []OTLPPushMiddleware `yaml:"-"`
 
@@ -2119,7 +2122,7 @@ func (d *Distributor) Push(ctx context.Context, req *mimirpb.WriteRequest) (*mim
 		mimirpb.ReuseSlice(req.Timeseries)
 	})
 
-	pushErr := d.PushWithMiddlewares(ctx, pushReq)
+	pushErr := d.PushExternal(ctx, pushReq)
 	if pushErr == nil {
 		return &mimirpb.WriteResponse{}, nil
 	}

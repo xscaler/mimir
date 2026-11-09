@@ -72,8 +72,13 @@ XS_PATCH_PATHS=(
   "vendor/modules.txt"
   "vendor/github.com/xscaler/*"
   "pkg/api/api.go"
+  "pkg/distributor/distributor.go"
+  "pkg/distributor/push.go"
+  "pkg/distributor/xs_push_gate.go"
+  "pkg/distributor/xs_push_gate_test.go"
   "pkg/mimir/admin_store.go"
   "pkg/mimir/admin_store_test.go"
+  "pkg/mimir/grpc_call_check.go"
   "pkg/mimir/mimir.go"
   "pkg/mimir/modules.go"
 )

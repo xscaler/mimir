@@ -549,6 +549,10 @@ func (t *Mimir) initDistributorService() (serv services.Service, err error) {
 	t.Cfg.Distributor.Compartments = t.Cfg.Compartments
 	t.Cfg.Distributor.UsageTrackerEnabled = t.Cfg.UsageTracker.Enabled
 
+	if t.AdminStore != nil {
+		t.Cfg.Distributor.PushGate = t.AdminStore.pushGate()
+	}
+
 	t.Distributor, err = distributor.New(t.Cfg.Distributor, t.Cfg.IngesterClient, t.Overrides,
 		t.ActiveGroupsCleanup, t.CostAttributionManager, t.IngesterRing, t.IngesterPartitionInstanceRings, t.IngesterPartitionRingWatchers,
 		canJoinDistributorsRing, writerEnabled, t.UsageTrackerPartitionRing, t.UsageTrackerInstanceRing, t.Registerer, util_log.Logger)
@@ -1345,7 +1349,8 @@ func (t *Mimir) initRuler() (serv services.Service, err error) {
 		)
 	}
 	rulesFS := afero.NewMemMapFs()
-	var pusher ruler.Pusher = t.Distributor
+	// The ruler writes recording rule results in process. The push gate covers external pushes only.
+	var pusher ruler.Pusher = rulerPusher{t.Distributor}
 	if t.Cfg.rulerRemoteWritesEnabled() {
 		pusher = t.RulerDistributorClient
 	}

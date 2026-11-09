@@ -204,6 +204,9 @@ func OTLPHandler(
 				msgs = append(msgs, "insight", true)
 				logLevel = level.Warn
 			}
+			if isPushGateError(pushErr) {
+				logLevel = level.Debug
+			}
 			logLevel(logger).Log(msgs...)
 		}
 		addErrorHeaders(w, pushErr, r, httpCode, retryCfg)
