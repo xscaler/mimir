@@ -318,6 +318,9 @@ type Config struct {
 	// These functions will only receive samples that don't get dropped by HA deduplication.
 	PushWrappers []PushWrapper `yaml:"-"`
 
+	// PushGate, when set, denies the pushes of tenants before any other processing.
+	PushGate PushGate `yaml:"-"`
+
 	// OTLPPushMiddlewares are wrappers that are called when an OTLP push request is received.
 	OTLPPushMiddlewares []OTLPPushMiddleware `yaml:"-"`
 
@@ -1216,6 +1219,9 @@ func (d *Distributor) wrapPushWithMiddlewares(next PushFunc) PushFunc {
 	// The middlewares will be applied to the request (!) in the specified order, from first to last.
 	// To guarantee that, middleware functions will be called in reversed order, wrapping the
 	// result from previous call.
+	if d.cfg.PushGate != nil {
+		middlewares = append(middlewares, d.pushGateMiddleware) // Denies a tenant before anything reads or counts the request.
+	}
 	middlewares = append(middlewares, d.limitsMiddleware) // Should run first because it checks limits before other middlewares need to read the request body.
 	middlewares = append(middlewares, d.metricsMiddleware)
 	middlewares = append(middlewares, d.prePushHaDedupeMiddleware)

@@ -401,7 +401,9 @@ func addErrorHeaders(w http.ResponseWriter, err error, r *http.Request, response
 		w.Header().Set(server.DoNotLogErrorHeaderKey, "true")
 	}
 
-	if responseCode == http.StatusTooManyRequests || responseCode/100 == 5 {
+	if retryAfter, ok := retryAfterFromError(err); ok {
+		w.Header().Set("Retry-After", retryAfter)
+	} else if responseCode == http.StatusTooManyRequests || responseCode/100 == 5 {
 		if retryCfg.Enabled {
 			retryAttemptHeader := r.Header.Get("Retry-Attempt")
 			retrySeconds := calculateRetryAfter(retryAttemptHeader, retryCfg.MinBackoff, retryCfg.MaxBackoff)

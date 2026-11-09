@@ -469,3 +469,85 @@ func TestAdminStoreConfig_ValidateStartupWait(t *testing.T) {
 	cfg.Enabled = false
 	require.NoError(t, cfg.Validate())
 }
+
+func publishAdminStoreTenants(t *testing.T, bkt objstore.Bucket, gen int64, tenants string) {
+	t.Helper()
+	ctx := context.Background()
+
+	objects := map[string]string{}
+	for name, body := range map[string]string{"limits/mimir.json": `{"schema":1,"tenants":{}}`, "tenants.json": tenants} {
+		sum := sha256.Sum256([]byte(body))
+		objects[adminStorePrefix+name] = hex.EncodeToString(sum[:])
+		require.NoError(t, bkt.Upload(ctx, adminStorePrefix+name, bytes.NewReader([]byte(body))))
+	}
+	man, err := json.Marshal(map[string]any{
+		"schema": 1, "generation": gen, "published_at": time.Unix(1_800_000_000+gen, 0).UTC(), "objects": objects,
+	})
+	require.NoError(t, err)
+	require.NoError(t, bkt.Upload(ctx, adminStorePrefix+"manifest.json", bytes.NewReader(man)))
+}
+
+func TestAdminStore_PushGate(t *testing.T) {
+	setTestDefaultLimits(t)
+	const tenants = `{"schema":1,"tenants":{
+		"locked":{"org_id":"locked","state":"soft_locked"},
+		"active":{"org_id":"active","state":"active"},
+		"suspended":{"org_id":"suspended","state":"suspended"}}}`
+
+	for _, tc := range []struct {
+		mode   string
+		tenant string
+		deny   bool
+	}{
+		{"off", "locked", false},
+		{"shadow", "locked", false},
+		{"on", "locked", true},
+		{"on", "active", false},
+		{"on", "suspended", false},
+		{"on", "unknown", false},
+		{"shadow", "unknown", false},
+	} {
+		t.Run(tc.mode+"/"+tc.tenant, func(t *testing.T) {
+			bkt := objstore.NewInMemBucket()
+			publishAdminStoreTenants(t, bkt, 1, tenants)
+			a := newTestAdminStore(t, bkt, 5*time.Second, log.NewNopLogger())
+			a.cfg.EnforceState = tc.mode
+			runTestAdminStore(t, a)
+
+			gate := a.pushGate()
+			if tc.mode == "off" {
+				require.Nil(t, gate, "off installs no gate")
+				return
+			}
+			require.NotNil(t, gate)
+			deny, reason := gate(tc.tenant)
+			require.Equal(t, tc.deny, deny)
+			if tc.deny {
+				require.Equal(t, "billing_soft_locked", reason)
+			}
+		})
+	}
+}
+
+func TestAdminStore_PushGateOffByDefault(t *testing.T) {
+	cfg := Config{}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	cfg.RegisterFlags(fs, log.NewNopLogger())
+	require.Equal(t, "off", cfg.AdminStore.EnforceState)
+	require.NotNil(t, fs.Lookup("xscaler.admin-store.enforce-state"))
+
+	a := newTestAdminStore(t, objstore.NewInMemBucket(), time.Second, log.NewNopLogger())
+	require.Nil(t, a.pushGate())
+}
+
+func TestAdminStoreConfig_ValidateEnforceState(t *testing.T) {
+	cfg := AdminStoreConfig{}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	cfg.RegisterFlags(fs)
+	for _, v := range []string{"off", "shadow", "on"} {
+		cfg.EnforceState = v
+		require.NoError(t, cfg.Validate(), v)
+	}
+	cfg.EnforceState = "block"
+	require.ErrorContains(t, cfg.Validate(), "xscaler.admin-store.enforce-state")
+}

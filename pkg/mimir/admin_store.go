@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/xscaler/dskit/xstenant"
 
+	"github.com/grafana/mimir/pkg/distributor"
 	"github.com/grafana/mimir/pkg/storage/bucket"
 	util_log "github.com/grafana/mimir/pkg/util/log"
 	"github.com/grafana/mimir/pkg/util/validation"
@@ -31,6 +32,7 @@ type AdminStoreConfig struct {
 	CacheDir     string        `yaml:"cache_dir" category:"experimental"`
 	PollInterval time.Duration `yaml:"poll_interval" category:"experimental"`
 	StartupWait  time.Duration `yaml:"startup_wait" category:"experimental"`
+	EnforceState string        `yaml:"enforce_state" category:"experimental"`
 
 	Bucket bucket.Config `yaml:",inline"`
 }
@@ -41,11 +43,15 @@ func (c *AdminStoreConfig) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&c.CacheDir, "xscaler.admin-store.cache-dir", "", "Directory where the last applied admin store generation is kept, so a restart can serve it while the bucket is unreachable. Empty disables the cache.")
 	f.DurationVar(&c.PollInterval, "xscaler.admin-store.poll-interval", 5*time.Second, "How often the admin store manifest is polled.")
 	f.DurationVar(&c.StartupWait, "xscaler.admin-store.startup-wait", 30*time.Second, "How long to wait for the first admin store snapshot at startup before continuing with default limits. Must be positive. The compactor module additionally waits, without a limit, until the first snapshot is applied before it starts. In a process that also runs the compactor (for example -target=all), /ready stays not ready until the first snapshot is applied, while the other modules keep serving.")
+	f.StringVar(&c.EnforceState, "xscaler.admin-store.enforce-state", xstenant.EnforceOff.String(), "Deny the pushes of tenants that the admin store publishes as soft_locked (billing): remote write, OTLP and Influx get HTTP 429 with Retry-After 60, gRPC gets ResourceExhausted. Reads are never denied. Requires the admin store to be enabled. Supported values: off, shadow (never denies, counts the pushes it would deny), on.")
 	c.Bucket.RegisterFlagsWithPrefix("xscaler.admin-store.", f)
 }
 
 // Validate validates the admin store configuration.
 func (c *AdminStoreConfig) Validate() error {
+	if _, err := xstenant.ParseEnforceMode(c.EnforceState); err != nil {
+		return fmt.Errorf("xscaler.admin-store.enforce-state: %w", err)
+	}
 	if !c.Enabled {
 		return nil
 	}
@@ -56,6 +62,16 @@ func (c *AdminStoreConfig) Validate() error {
 		return errors.New("xscaler.admin-store.startup-wait must be positive")
 	}
 	return c.Bucket.Validate()
+}
+
+// enforceMode returns the configured push enforcement mode. An invalid value
+// is rejected by Validate and reads as off here.
+func (c *AdminStoreConfig) enforceMode() xstenant.EnforceMode {
+	m, err := xstenant.ParseEnforceMode(c.EnforceState)
+	if err != nil {
+		return xstenant.EnforceOff
+	}
+	return m
 }
 
 // adminStore reads per-tenant limits from the admin store and keeps them
@@ -100,6 +116,18 @@ func newAdminStore(cfg AdminStoreConfig, bkt xstenant.Bucket, validate func(*val
 		logger:  logger,
 		runtime: runtime,
 	}, nil
+}
+
+// pushGate returns the distributor push gate for the configured mode, or nil
+// when enforcement is off.
+func (a *adminStore) pushGate() distributor.PushGate {
+	mode := a.cfg.enforceMode()
+	if mode == xstenant.EnforceOff {
+		return nil
+	}
+	return func(tenantID string) (bool, string) {
+		return a.reader.CheckPush(tenantID, mode)
+	}
 }
 
 // tenantLimits returns the admin store as the TenantLimits Mimir enforces.
