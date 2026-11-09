@@ -139,3 +139,10 @@ func (d *Distributor) PushExternal(ctx context.Context, pushReq *Request) error 
 	}
 	return d.pushGateMiddleware(d.PushWithMiddlewares)(ctx, pushReq)
 }
+
+// isPushGateError reports whether err is a push the gate denied. The push
+// handlers log these at debug, since a locked tenant retries all the time.
+func isPushGateError(err error) bool {
+	var e pushGateError
+	return errors.As(err, &e)
+}

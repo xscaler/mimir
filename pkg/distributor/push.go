@@ -262,7 +262,11 @@ func handler(
 				if retryAttempt, err := strconv.Atoi(r.Header.Get("Retry-Attempt")); err == nil && retryAttempt > 0 {
 					msgs = append(msgs, "retryAttempt", retryAttempt)
 				}
-				level.Error(logger).Log(msgs...)
+				if isPushGateError(err) {
+					level.Debug(logger).Log(msgs...)
+				} else {
+					level.Error(logger).Log(msgs...)
+				}
 			}
 			addErrorHeaders(w, err, r, code, retryCfg)
 			http.Error(w, validUTF8Message(msg), code)

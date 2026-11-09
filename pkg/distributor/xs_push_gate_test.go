@@ -244,3 +244,29 @@ func TestPushGate_RequiresTenant(t *testing.T) {
 	require.Error(t, err)
 	assert.Zero(t, passed)
 }
+
+func TestPushGate_DenialLogLevel(t *testing.T) {
+	for _, p := range gatePaths() {
+		if p.name == "influx" {
+			continue
+		}
+		t.Run(p.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := log.NewLogfmtLogger(&buf)
+			var h http.Handler
+			if p.name == "otlp" {
+				reg := prometheus.NewRegistry()
+				h = OTLPHandler(100000, util.NewBufferPool(0), nil, false, otlpLimitsMock{}, nil, nil, RetryConfig{}, nil, gatedPush(lockedGate, new(int)), newPushMetrics(reg), reg, logger)
+			} else {
+				h = Handler(100000, nil, nil, false, false, nil, RetryConfig{}, gatedPush(lockedGate, new(int)), nil, logger)
+			}
+			resp := httptest.NewRecorder()
+			h.ServeHTTP(resp, p.request(t, lockedTenant))
+
+			require.Equal(t, http.StatusTooManyRequests, resp.Code)
+			assert.Contains(t, buf.String(), "level=debug")
+			assert.NotContains(t, buf.String(), "level=error")
+			assert.NotContains(t, buf.String(), "level=warn")
+		})
+	}
+}
