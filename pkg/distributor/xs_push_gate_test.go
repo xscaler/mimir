@@ -10,13 +10,13 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
+	"github.com/grafana/dskit/grpcutil"
 	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/grafana/mimir/pkg/util"
 )
@@ -127,7 +127,7 @@ func TestPushGate_GRPCStatus(t *testing.T) {
 	d := &Distributor{}
 	err := d.handlePushError(pushGateError{reason: "billing_soft_locked"})
 
-	st, ok := status.FromError(err)
+	st, ok := grpcutil.ErrorToStatus(err)
 	require.True(t, ok)
 	assert.Equal(t, codes.ResourceExhausted, st.Code())
 	assert.Contains(t, st.Message(), "billing_soft_locked")
