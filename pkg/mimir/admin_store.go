@@ -8,16 +8,21 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/runtimeconfig"
 	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/xscaler/dskit/xstenant"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/grafana/mimir/pkg/distributor"
+	"github.com/grafana/mimir/pkg/mimirpb"
+	"github.com/grafana/mimir/pkg/ruler"
 	"github.com/grafana/mimir/pkg/storage/bucket"
 	util_log "github.com/grafana/mimir/pkg/util/log"
 	"github.com/grafana/mimir/pkg/util/validation"
@@ -49,11 +54,11 @@ func (c *AdminStoreConfig) RegisterFlags(f *flag.FlagSet) {
 
 // Validate validates the admin store configuration.
 func (c *AdminStoreConfig) Validate() error {
-	if _, err := xstenant.ParseEnforceMode(c.EnforceState); err != nil {
-		return fmt.Errorf("xscaler.admin-store.enforce-state: %w", err)
-	}
 	if !c.Enabled {
 		return nil
+	}
+	if _, err := xstenant.ParseEnforceMode(c.EnforceState); err != nil && c.EnforceState != "" {
+		return fmt.Errorf("xscaler.admin-store.enforce-state: %w", err)
 	}
 	if c.PollInterval <= 0 {
 		return errors.New("xscaler.admin-store.poll-interval must be positive")
@@ -64,9 +69,13 @@ func (c *AdminStoreConfig) Validate() error {
 	return c.Bucket.Validate()
 }
 
-// enforceMode returns the configured push enforcement mode. An invalid value
-// is rejected by Validate and reads as off here.
+// enforceMode returns the configured push enforcement mode. An empty value
+// means off. An invalid value is rejected by Validate when the admin store is
+// enabled and reads as off here.
 func (c *AdminStoreConfig) enforceMode() xstenant.EnforceMode {
+	if c.EnforceState == "" {
+		return xstenant.EnforceOff
+	}
 	m, err := xstenant.ParseEnforceMode(c.EnforceState)
 	if err != nil {
 		return xstenant.EnforceOff
@@ -266,4 +275,34 @@ func (t *Mimir) initAdminStoreReady() (services.Service, error) {
 		return nil, nil
 	}
 	return t.AdminStore.readyService(), nil
+}
+
+// pushGater is implemented by the distributor. It denies the pushes of
+// tenants the push gate blocks.
+type pushGater interface {
+	CheckPushGate(ctx context.Context, tenantID string) (context.Context, error)
+}
+
+// gatePush runs the push gate from the gRPC method limiter, before the
+// request takes an inflight slot. The tenant comes from the request metadata.
+// Without it the gate runs later, in the push path.
+func gatePush(ctx context.Context, dist pushReceiver, md metadata.MD) (context.Context, error) {
+	g, ok := dist.(pushGater)
+	if !ok {
+		return ctx, nil
+	}
+	tenantID := getSingleMetadata(md, strings.ToLower(user.OrgIDHeaderName))
+	if tenantID == "" {
+		return ctx, nil
+	}
+	return g.CheckPushGate(ctx, tenantID)
+}
+
+// rulerPusher marks the writes of the ruler, which the push gate does not deny.
+type rulerPusher struct {
+	ruler.Pusher
+}
+
+func (p rulerPusher) Push(ctx context.Context, req *mimirpb.WriteRequest) (*mimirpb.WriteResponse, error) {
+	return p.Pusher.Push(distributor.WithPushGateBypass(ctx), req)
 }

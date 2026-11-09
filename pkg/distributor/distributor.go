@@ -1219,9 +1219,6 @@ func (d *Distributor) wrapPushWithMiddlewares(next PushFunc) PushFunc {
 	// The middlewares will be applied to the request (!) in the specified order, from first to last.
 	// To guarantee that, middleware functions will be called in reversed order, wrapping the
 	// result from previous call.
-	if d.cfg.PushGate != nil {
-		middlewares = append(middlewares, d.pushGateMiddleware) // Denies a tenant before anything reads or counts the request.
-	}
 	middlewares = append(middlewares, d.limitsMiddleware) // Should run first because it checks limits before other middlewares need to read the request body.
 	middlewares = append(middlewares, d.metricsMiddleware)
 	middlewares = append(middlewares, d.prePushHaDedupeMiddleware)
@@ -2125,7 +2122,7 @@ func (d *Distributor) Push(ctx context.Context, req *mimirpb.WriteRequest) (*mim
 		mimirpb.ReuseSlice(req.Timeseries)
 	})
 
-	pushErr := d.PushWithMiddlewares(ctx, pushReq)
+	pushErr := d.PushExternal(ctx, pushReq)
 	if pushErr == nil {
 		return &mimirpb.WriteResponse{}, nil
 	}

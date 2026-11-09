@@ -315,13 +315,13 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 	}
 	a.RegisterRoute(PrometheusPushEndpoint, distributor.Handler(
 		pushConfig.MaxRecvMsgSize, newRequestBuffers, a.sourceIPs, a.cfg.SkipLabelNameValidationHeader,
-		a.cfg.SkipLabelCountValidationHeader, limits, pushConfig.RetryConfig, d.PushWithMiddlewares, d.PushMetrics, a.logger,
+		a.cfg.SkipLabelCountValidationHeader, limits, pushConfig.RetryConfig, d.PushExternal, d.PushMetrics, a.logger,
 	), true, false, "POST")
 
 	if pushConfig.EnableInfluxEndpoint {
 		// The Influx Push endpoint is experimental.
 		a.RegisterRoute(InfluxPushEndpoint, distributor.InfluxHandler(
-			pushConfig.MaxInfluxRequestSize, d.RequestBufferPool, a.sourceIPs, pushConfig.RetryConfig, d.PushWithMiddlewares, d.PushMetrics, a.logger,
+			pushConfig.MaxInfluxRequestSize, d.RequestBufferPool, a.sourceIPs, pushConfig.RetryConfig, d.PushExternal, d.PushMetrics, a.logger,
 		), true, false, "POST")
 	}
 
@@ -330,7 +330,7 @@ func (a *API) RegisterDistributor(d *distributor.Distributor, pushConfig distrib
 		pushConfig.OTelResourceAttributePromotionConfig,
 		pushConfig.KeepIdentifyingOTelResourceAttributesConfig,
 		pushConfig.RetryConfig, pushConfig.OTLPPushMiddlewares,
-		d.PushWithMiddlewares, d.PushMetrics, reg, a.logger,
+		d.PushExternal, d.PushMetrics, reg, a.logger,
 	), true, false, "POST")
 
 	a.indexPage.AddLinks(defaultWeight, "Distributor", []IndexPageLink{

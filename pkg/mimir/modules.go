@@ -1349,7 +1349,8 @@ func (t *Mimir) initRuler() (serv services.Service, err error) {
 		)
 	}
 	rulesFS := afero.NewMemMapFs()
-	var pusher ruler.Pusher = t.Distributor
+	// The ruler writes recording rule results in process. The push gate covers external pushes only.
+	var pusher ruler.Pusher = rulerPusher{t.Distributor}
 	if t.Cfg.rulerRemoteWritesEnabled() {
 		pusher = t.RulerDistributorClient
 	}

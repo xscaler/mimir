@@ -22,14 +22,23 @@ import (
 	"github.com/go-kit/log"
 	"github.com/gorilla/mux"
 	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/grpcutil"
+	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/server"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/user"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
+	"github.com/xscaler/dskit/xstenant"
 	"go.uber.org/atomic"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
+	"github.com/grafana/mimir/pkg/api"
+	"github.com/grafana/mimir/pkg/distributor"
+	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/util/validation"
 )
 
@@ -544,10 +553,90 @@ func TestAdminStoreConfig_ValidateEnforceState(t *testing.T) {
 	cfg := AdminStoreConfig{}
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	cfg.RegisterFlags(fs)
-	for _, v := range []string{"off", "shadow", "on"} {
+	cfg.Enabled = true
+	cfg.Bucket.Backend = "filesystem"
+	cfg.Bucket.Filesystem.Directory = t.TempDir()
+
+	// An empty value reads as off.
+	for _, v := range []string{"", "off", "shadow", "on"} {
 		cfg.EnforceState = v
 		require.NoError(t, cfg.Validate(), v)
 	}
+	cfg.EnforceState = ""
+	require.Equal(t, xstenant.EnforceOff, cfg.enforceMode())
+
 	cfg.EnforceState = "block"
 	require.ErrorContains(t, cfg.Validate(), "xscaler.admin-store.enforce-state")
+
+	// The value is only checked when the admin store is enabled.
+	cfg.Enabled = false
+	require.NoError(t, cfg.Validate())
+}
+
+type gatingDistributorReceiver struct {
+	mockDistributorReceiver
+	gateCalls int
+	denied    map[string]bool
+}
+
+func (g *gatingDistributorReceiver) CheckPushGate(ctx context.Context, tenantID string) (context.Context, error) {
+	g.gateCalls++
+	if g.denied[tenantID] {
+		return ctx, status.Error(codes.ResourceExhausted, "billing_soft_locked")
+	}
+	return ctx, nil
+}
+
+func TestGrpcInflightMethodLimiter_PushGate(t *testing.T) {
+	md := func(tenantID string) metadata.MD {
+		m := metadata.Pairs(httpgrpc.MetadataMethod, "POST", httpgrpc.MetadataURL, api.PrometheusPushEndpoint)
+		if tenantID != "" {
+			m.Set("x-scope-orgid", tenantID)
+		}
+		return m
+	}
+	newLimiter := func(m *gatingDistributorReceiver) *grpcInflightMethodLimiter {
+		return newGrpcInflightMethodLimiter(nil, func() pushReceiver { return m })
+	}
+
+	t.Run("denied tenant takes no inflight slot", func(t *testing.T) {
+		m := &gatingDistributorReceiver{denied: map[string]bool{"locked": true}}
+		_, err := newLimiter(m).RPCCallStarting(context.Background(), httpgrpcHandleMethod, md("locked"))
+		st, ok := grpcutil.ErrorToStatus(err)
+		require.True(t, ok)
+		require.Equal(t, codes.ResourceExhausted, st.Code())
+		require.Equal(t, 0, m.startCalls)
+	})
+
+	t.Run("allowed tenant continues to the inflight check", func(t *testing.T) {
+		m := &gatingDistributorReceiver{denied: map[string]bool{"locked": true}}
+		_, err := newLimiter(m).RPCCallStarting(context.Background(), httpgrpcHandleMethod, md("active"))
+		require.NoError(t, err)
+		require.Equal(t, 1, m.gateCalls)
+		require.Equal(t, 1, m.startCalls)
+	})
+
+	t.Run("no tenant in the metadata leaves the gate to the push path", func(t *testing.T) {
+		m := &gatingDistributorReceiver{denied: map[string]bool{"locked": true}}
+		_, err := newLimiter(m).RPCCallStarting(context.Background(), httpgrpcHandleMethod, md(""))
+		require.NoError(t, err)
+		require.Equal(t, 0, m.gateCalls)
+		require.Equal(t, 1, m.startCalls)
+	})
+}
+
+type recordingPusher struct {
+	bypassed bool
+}
+
+func (p *recordingPusher) Push(ctx context.Context, _ *mimirpb.WriteRequest) (*mimirpb.WriteResponse, error) {
+	p.bypassed = distributor.PushGateBypassed(ctx)
+	return &mimirpb.WriteResponse{}, nil
+}
+
+func TestRulerPusher_BypassesPushGate(t *testing.T) {
+	p := &recordingPusher{}
+	_, err := rulerPusher{p}.Push(context.Background(), &mimirpb.WriteRequest{})
+	require.NoError(t, err)
+	require.True(t, p.bypassed)
 }
