@@ -1387,7 +1387,7 @@ github.com/xhit/go-str2duration/v2
 # github.com/xlab/treeprint v1.2.0
 ## explicit; go 1.13
 github.com/xlab/treeprint
-# github.com/xscaler/dskit/xstenant v0.2.0
+# github.com/xscaler/dskit/xstenant v0.3.0
 ## explicit; go 1.26.10
 github.com/xscaler/dskit/xstenant
 # github.com/yusufpapurcu/wmi v1.2.4
