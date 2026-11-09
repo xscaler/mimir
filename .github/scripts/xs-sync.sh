@@ -72,6 +72,7 @@ XS_PATCH_PATHS=(
   "vendor/modules.txt"
   "vendor/github.com/xscaler/*"
   "pkg/api/api.go"
+  "pkg/api/xs_request_authorizer_test.go"
   "pkg/distributor/distributor.go"
   "pkg/distributor/push.go"
   "pkg/distributor/xs_push_gate.go"

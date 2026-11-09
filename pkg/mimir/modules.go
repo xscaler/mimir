@@ -758,7 +758,8 @@ func (t *Mimir) initQuerier() (serv services.Service, err error) {
 		// Second, set the http.Handler that the frontend worker will use to process requests to point to
 		// the external HTTP server. This will allow the querier to consolidate query metrics both external
 		// and internal using the default instrumentation when running as a standalone service.
-		internalQuerierRouter = t.Server.HTTPServer.Handler
+		// Requests from the worker come from other components, not from a client.
+		internalQuerierRouter = api.SkipRequestAuthorizer(t.Server.HTTPServer.Handler)
 	} else {
 		// Monolithic mode requires a query-frontend endpoint for the worker. If no frontend and scheduler endpoint
 		// is configured, Mimir will default to using frontend on localhost on its own gRPC listening port.

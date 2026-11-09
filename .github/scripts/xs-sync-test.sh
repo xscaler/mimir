@@ -114,7 +114,7 @@ expect "gt major" "no" "${r}"
 
 # patch path rules
 for p in .github/workflows/xs-test.yml .github/scripts/xs-sync.sh go.mod go.sum vendor/modules.txt \
-  pkg/mimir/admin_store.go pkg/mimir/grpc_call_check.go pkg/mimir/modules.go pkg/api/api.go \
+  pkg/mimir/admin_store.go pkg/mimir/grpc_call_check.go pkg/mimir/modules.go pkg/api/api.go pkg/api/xs_request_authorizer_test.go \
   pkg/distributor/distributor.go pkg/distributor/push.go pkg/distributor/xs_push_gate.go pkg/distributor/xs_push_gate_test.go vendor/github.com/xscaler/dskit/xstenant/reader.go; do
   xs_path_allowed "${p}" && r=yes || r=no
   expect "allowed ${p}" "yes" "${r}"

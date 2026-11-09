@@ -640,3 +640,247 @@ func TestRulerPusher_BypassesPushGate(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, p.bypassed)
 }
+
+func hashToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// writeAdminStoreWithKeys writes an admin store with two keys for tenant t1
+// (read-only and write-only) and one for t2 into a filesystem bucket.
+func writeAdminStoreWithKeys(t *testing.T, dir string) {
+	t.Helper()
+	root := filepath.Join(dir, "admin", "v1")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "limits"), 0o755))
+	keys := `{"schema":1,"keys":{
+		"` + hashToken("read-key") + `":{"tenant_id":"t1","scopes":["read"]},
+		"` + hashToken("write-key") + `":{"tenant_id":"t1","scopes":["write"]},
+		"` + hashToken("other-key") + `":{"tenant_id":"t2","scopes":["read","write"]}}}`
+	files := map[string]string{
+		"limits/mimir.json": `{"schema":1,"tenants":{}}`,
+		"tenants.json":      `{"schema":1,"tenants":{}}`,
+		"keys.json":         keys,
+	}
+	objects := map[string]string{}
+	for name, body := range files {
+		sum := sha256.Sum256([]byte(body))
+		objects[adminStorePrefix+name] = hex.EncodeToString(sum[:])
+		require.NoError(t, os.WriteFile(filepath.Join(root, name), []byte(body), 0o600))
+	}
+	man, err := json.Marshal(map[string]any{
+		"schema": 1, "generation": 1, "published_at": time.Unix(1_800_000_000, 0).UTC(), "objects": objects,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "manifest.json"), man, 0o600))
+}
+
+func newAuthTestMimir(t *testing.T, mode string, promPrefix string) *Mimir {
+	t.Helper()
+	setTestDefaultLimits(t)
+	dir := t.TempDir()
+	writeAdminStoreWithKeys(t, dir)
+
+	cfg := newDefaultConfig()
+	cfg.Target = []string{Distributor}
+	cfg.API.PrometheusHTTPPrefix = promPrefix
+	cfg.AdminStore.Enabled = true
+	cfg.AdminStore.EnforceAuth = mode
+	cfg.AdminStore.PollInterval = 10 * time.Millisecond
+	cfg.AdminStore.Bucket.Backend = "filesystem"
+	cfg.AdminStore.Bucket.Filesystem.Directory = dir
+
+	m := &Mimir{Cfg: *cfg, Registerer: prometheus.NewPedanticRegistry()}
+	m.Server = &server.Server{Registerer: prometheus.NewPedanticRegistry(), HTTP: mux.NewRouter()}
+	require.NoError(t, m.setupModuleManager())
+	_, err := m.initAPI()
+	require.NoError(t, err)
+	_, err = m.initRuntimeConfig()
+	require.NoError(t, err)
+
+	// Routes are registered before the admin store starts, as other modules do.
+	echo := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, err := user.ExtractOrgID(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(id))
+	})
+	m.API.RegisterRoute("/api/v1/push", echo, true, false, http.MethodPost)
+	m.API.RegisterRoute("/otlp/v1/metrics", echo, true, false, http.MethodPost)
+	m.API.RegisterRoute(promPrefix+"/api/v1/query", echo, true, false, http.MethodGet)
+	m.API.RegisterRoute(promPrefix+"/api/v1/rules", echo, true, false, http.MethodGet)
+	m.API.RegisterRoute("/api/v1/cardinality/label_names", echo, true, false, http.MethodGet)
+	m.API.RegisterRoute("/open", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }), false, false, http.MethodGet)
+
+	svc, err := m.initAdminStore()
+	require.NoError(t, err)
+	require.NoError(t, services.StartAndAwaitRunning(context.Background(), svc))
+	t.Cleanup(func() { require.NoError(t, services.StopAndAwaitTerminated(context.Background(), svc)) })
+	return m
+}
+
+func TestAdminStore_EnforceAuthHTTP(t *testing.T) {
+	type result struct {
+		code int
+		org  string // body of an allowed request: the org id the handler saw
+	}
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		token  string
+		org    string
+		off    result
+		shadow result
+		on     result
+	}{
+		{"read key reads under the prefix", "GET", "/prometheus/api/v1/query?query=up", "read-key", "t1",
+			result{200, "t1"}, result{200, "t1"}, result{200, "t1"}},
+		{"read key reads without the prefix", "GET", "/api/v1/query", "read-key", "t1",
+			result{404, ""}, result{404, ""}, result{404, ""}},
+		{"read key lists rules", "GET", "/prometheus/api/v1/rules", "read-key", "t1",
+			result{200, "t1"}, result{200, "t1"}, result{200, "t1"}},
+		{"read key reads cardinality", "GET", "/api/v1/cardinality/label_names", "read-key", "t1",
+			result{200, "t1"}, result{200, "t1"}, result{200, "t1"}},
+		{"read key cannot push", "POST", "/api/v1/push", "read-key", "t1",
+			result{200, "t1"}, result{200, "t1"}, result{403, ""}},
+		{"write key pushes", "POST", "/api/v1/push", "write-key", "t1",
+			result{200, "t1"}, result{200, "t1"}, result{200, "t1"}},
+		{"write key pushes OTLP", "POST", "/otlp/v1/metrics", "write-key", "t1",
+			result{200, "t1"}, result{200, "t1"}, result{200, "t1"}},
+		{"write key cannot read", "GET", "/prometheus/api/v1/query", "write-key", "t1",
+			result{200, "t1"}, result{200, "t1"}, result{403, ""}},
+		{"other tenant org id", "GET", "/prometheus/api/v1/query", "read-key", "t2",
+			result{200, "t2"}, result{200, "t2"}, result{401, ""}},
+		{"unknown key", "GET", "/prometheus/api/v1/query", "nope", "t1",
+			result{200, "t1"}, result{200, "t1"}, result{401, ""}},
+		{"no key", "GET", "/prometheus/api/v1/query", "", "t1",
+			result{200, "t1"}, result{200, "t1"}, result{401, ""}},
+		{"no org id", "GET", "/prometheus/api/v1/query", "read-key", "",
+			result{401, ""}, result{401, ""}, result{401, ""}},
+	} {
+		for _, mode := range []string{"off", "shadow", "on"} {
+			want := map[string]result{"off": tc.off, "shadow": tc.shadow, "on": tc.on}[mode]
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				m := newAuthTestMimir(t, mode, "/prometheus")
+				req := httptest.NewRequest(tc.method, tc.path, nil)
+				if tc.token != "" {
+					req.Header.Set("Authorization", "Bearer "+tc.token)
+				}
+				if tc.org != "" {
+					req.Header.Set(user.OrgIDHeaderName, tc.org)
+				}
+				rec := httptest.NewRecorder()
+				m.Server.HTTP.ServeHTTP(rec, req)
+				require.Equal(t, want.code, rec.Code, rec.Body.String())
+				if want.code == http.StatusOK {
+					require.Equal(t, want.org, rec.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestAdminStore_EnforceAuthCustomPrefix(t *testing.T) {
+	m := newAuthTestMimir(t, "on", "/api/prom")
+	req := httptest.NewRequest(http.MethodGet, "/api/prom/api/v1/query", nil)
+	req.Header.Set("Authorization", "Bearer read-key")
+	req.Header.Set(user.OrgIDHeaderName, "t1")
+	rec := httptest.NewRecorder()
+	m.Server.HTTP.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+}
+
+func TestAdminStore_EnforceAuthUnauthenticatedRoutesUntouched(t *testing.T) {
+	m := newAuthTestMimir(t, "on", "/prometheus")
+	// No key and no org id: an unauthenticated route still answers.
+	for _, path := range []string{"/open", "/config"} {
+		rec := httptest.NewRecorder()
+		m.Server.HTTP.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		require.Equal(t, http.StatusOK, rec.Code, path)
+	}
+}
+
+func TestAdminStore_EnforceAuthInternalRequestsUntouched(t *testing.T) {
+	m := newAuthTestMimir(t, "on", "/prometheus")
+	// A request fed in by another component (marked internal) carries no key.
+	req := httptest.NewRequest(http.MethodGet, "/prometheus/api/v1/query", nil)
+	req.Header.Set(user.OrgIDHeaderName, "t1")
+	rec := httptest.NewRecorder()
+	api.SkipRequestAuthorizer(m.Server.HTTP).ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "t1", rec.Body.String())
+
+	// gRPC is not wired to the authorizer: the push gate and the method limiter
+	// are the only admin store hooks on it.
+	m.Cfg.AdminStore.EnforceState = "off"
+	require.Nil(t, m.AdminStore.pushGate())
+}
+
+func TestAdminStore_RequestAuthorizerModes(t *testing.T) {
+	for _, tc := range []struct {
+		mode       string
+		allowed    bool
+		wantHeader string
+	}{
+		{"off", true, " t1 "},
+		{"shadow", true, " t1 "},
+		{"on", true, "t1"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			m := newAuthTestMimir(t, tc.mode, "/prometheus")
+			auth := m.AdminStore.requestAuthorizer("/prometheus")
+			if tc.mode == "off" {
+				require.Nil(t, auth, "off installs no authorizer")
+				return
+			}
+			req := httptest.NewRequest(http.MethodGet, "/prometheus/api/v1/query", nil)
+			req.Header.Set("Authorization", "Bearer read-key")
+			req.Header.Set(user.OrgIDHeaderName, " t1 ")
+			rec := httptest.NewRecorder()
+			require.True(t, auth(rec, req))
+			// Only an enforced decision replaces the org id.
+			require.Equal(t, tc.wantHeader, req.Header.Get(user.OrgIDHeaderName))
+
+			// A denial is answered in mode on only.
+			req = httptest.NewRequest(http.MethodGet, "/prometheus/api/v1/query", nil)
+			req.Header.Set(user.OrgIDHeaderName, "t1")
+			rec = httptest.NewRecorder()
+			require.Equal(t, tc.mode != "on", auth(rec, req))
+			if tc.mode == "on" {
+				require.Equal(t, http.StatusUnauthorized, rec.Code)
+				require.Contains(t, rec.Body.String(), "missing token")
+			} else {
+				require.Equal(t, "t1", req.Header.Get(user.OrgIDHeaderName))
+				require.Empty(t, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestAdminStoreConfig_ValidateEnforceAuth(t *testing.T) {
+	cfg := AdminStoreConfig{}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	cfg.RegisterFlags(fs)
+	require.NotNil(t, fs.Lookup("xscaler.admin-store.enforce-auth"))
+	require.Equal(t, "off", cfg.EnforceAuth)
+	cfg.Enabled = true
+	cfg.Bucket.Backend = "filesystem"
+	cfg.Bucket.Filesystem.Directory = t.TempDir()
+
+	for _, v := range []string{"", "off", "shadow", "on"} {
+		cfg.EnforceAuth = v
+		require.NoError(t, cfg.Validate(), v)
+	}
+	cfg.EnforceAuth = ""
+	require.Equal(t, xstenant.EnforceOff, cfg.enforceAuthMode())
+	cfg.EnforceAuth = "shadow"
+	require.Equal(t, xstenant.EnforceShadow, cfg.enforceAuthMode())
+
+	cfg.EnforceAuth = "block"
+	require.ErrorContains(t, cfg.Validate(), "xscaler.admin-store.enforce-auth")
+
+	cfg.Enabled = false
+	require.NoError(t, cfg.Validate(), "only checked when the admin store is enabled")
+}

@@ -7,11 +7,13 @@ package api
 
 import (
 	"compress/gzip"
+	"context"
 	"flag"
 	"fmt"
 	"net/http"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/felixge/fgprof"
@@ -104,8 +106,16 @@ func (cfg *Config) Validate() error {
 	return nil
 }
 
+// RequestAuthorizer checks a request on an external authenticated route before
+// the org id is read. It may change the request headers. It returns false after
+// it has answered the request itself.
+type RequestAuthorizer func(w http.ResponseWriter, r *http.Request) bool
+
 type API struct {
 	AuthMiddleware middleware.Interface
+
+	// authorizer runs in front of AuthMiddleware on every authenticated route.
+	authorizer atomic.Pointer[RequestAuthorizer]
 
 	cfg             Config
 	server          *server.Server
@@ -152,6 +162,42 @@ func New(cfg Config, federationCfg tenantfederation.Config, serverCfg server.Con
 	return api, nil
 }
 
+// SetRequestAuthorizer sets the authorizer applied to every route registered
+// with auth enabled, including routes registered earlier. Nil removes it.
+func (a *API) SetRequestAuthorizer(f RequestAuthorizer) {
+	if f == nil {
+		a.authorizer.Store(nil)
+		return
+	}
+	a.authorizer.Store(&f)
+}
+
+type skipAuthorizerKey struct{}
+
+// SkipRequestAuthorizer marks the requests of h as internal: the request
+// authorizer does not check them. It is for handlers that feed requests from
+// other components into the external router.
+func SkipRequestAuthorizer(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), skipAuthorizerKey{}, true)))
+	})
+}
+
+func (a *API) authorizerMiddleware() middleware.Interface {
+	return middleware.Func(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if skip, _ := r.Context().Value(skipAuthorizerKey{}).(bool); skip {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if f := a.authorizer.Load(); f != nil && !(*f)(w, r) {
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	})
+}
+
 // RegisterDeprecatedRoute behaves in a similar way to RegisterRoute. RegisterDeprecatedRoute also logs warnings on
 // invocations of the deprecated endpoints.
 func (a *API) RegisterDeprecatedRoute(path string, handler http.Handler, auth, gzipEnabled bool, method string, maxBodySizeIfAny int64, methods ...string) {
@@ -194,6 +240,9 @@ func (a *API) newRoute(path string, handler http.Handler, isPrefix, auth, gzip b
 
 	if auth {
 		handler = a.AuthMiddleware.Wrap(handler)
+		// Only routes registered here are external. The authorizer is not part
+		// of AuthMiddleware, which internal routers wrap as well.
+		handler = a.authorizerMiddleware().Wrap(handler)
 	}
 	if gzip {
 		handler = gziphandler.GzipHandler(handler, a.cfg.GzipCompressionLevel)

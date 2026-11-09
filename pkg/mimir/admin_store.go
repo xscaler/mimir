@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/xscaler/dskit/xstenant"
 	"google.golang.org/grpc/metadata"
 
+	"github.com/grafana/mimir/pkg/api"
 	"github.com/grafana/mimir/pkg/distributor"
 	"github.com/grafana/mimir/pkg/mimirpb"
 	"github.com/grafana/mimir/pkg/ruler"
@@ -38,6 +40,7 @@ type AdminStoreConfig struct {
 	PollInterval time.Duration `yaml:"poll_interval" category:"experimental"`
 	StartupWait  time.Duration `yaml:"startup_wait" category:"experimental"`
 	EnforceState string        `yaml:"enforce_state" category:"experimental"`
+	EnforceAuth  string        `yaml:"enforce_auth" category:"experimental"`
 
 	Bucket bucket.Config `yaml:",inline"`
 }
@@ -49,6 +52,7 @@ func (c *AdminStoreConfig) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&c.PollInterval, "xscaler.admin-store.poll-interval", 5*time.Second, "How often the admin store manifest is polled.")
 	f.DurationVar(&c.StartupWait, "xscaler.admin-store.startup-wait", 30*time.Second, "How long to wait for the first admin store snapshot at startup before continuing with default limits. Must be positive. The compactor module additionally waits, without a limit, until the first snapshot is applied before it starts. In a process that also runs the compactor (for example -target=all), /ready stays not ready until the first snapshot is applied, while the other modules keep serving.")
 	f.StringVar(&c.EnforceState, "xscaler.admin-store.enforce-state", xstenant.EnforceOff.String(), "Deny the pushes of tenants that the admin store publishes as soft_locked (billing): remote write, OTLP and Influx get HTTP 429 with Retry-After 60, gRPC gets ResourceExhausted. Reads are never denied. Requires the admin store to be enabled. Supported values: off, shadow (never denies, counts the pushes it would deny), on.")
+	f.StringVar(&c.EnforceAuth, "xscaler.admin-store.enforce-auth", xstenant.EnforceOff.String(), "Authorize requests on the external HTTP API routes with the API keys the admin store publishes. A request needs a Bearer API key whose tenant matches X-Scope-OrgID, a path the key may call and the read or write scope the path needs. Internal gRPC and unauthenticated routes are not checked. Requires the admin store to be enabled. Supported values: off, shadow (never denies or changes a request, counts the requests it would deny), on (denies with the decision status and sets X-Scope-OrgID to the key's tenant).")
 	c.Bucket.RegisterFlagsWithPrefix("xscaler.admin-store.", f)
 }
 
@@ -59,6 +63,9 @@ func (c *AdminStoreConfig) Validate() error {
 	}
 	if _, err := xstenant.ParseEnforceMode(c.EnforceState); err != nil && c.EnforceState != "" {
 		return fmt.Errorf("xscaler.admin-store.enforce-state: %w", err)
+	}
+	if _, err := xstenant.ParseEnforceMode(c.EnforceAuth); err != nil && c.EnforceAuth != "" {
+		return fmt.Errorf("xscaler.admin-store.enforce-auth: %w", err)
 	}
 	if c.PollInterval <= 0 {
 		return errors.New("xscaler.admin-store.poll-interval must be positive")
@@ -77,6 +84,19 @@ func (c *AdminStoreConfig) enforceMode() xstenant.EnforceMode {
 		return xstenant.EnforceOff
 	}
 	m, err := xstenant.ParseEnforceMode(c.EnforceState)
+	if err != nil {
+		return xstenant.EnforceOff
+	}
+	return m
+}
+
+// enforceAuthMode returns the configured API key authorization mode. An empty
+// or invalid value reads as off, like enforceMode.
+func (c *AdminStoreConfig) enforceAuthMode() xstenant.EnforceMode {
+	if c.EnforceAuth == "" {
+		return xstenant.EnforceOff
+	}
+	m, err := xstenant.ParseEnforceMode(c.EnforceAuth)
 	if err != nil {
 		return xstenant.EnforceOff
 	}
@@ -136,6 +156,38 @@ func (a *adminStore) pushGate() distributor.PushGate {
 	}
 	return func(tenantID string) (bool, string) {
 		return a.reader.CheckPush(tenantID, mode)
+	}
+}
+
+// requestAuthorizer returns the authorizer for the external HTTP API routes,
+// or nil when API key authorization is off. promPrefix is the configured
+// Prometheus HTTP prefix, which the key rules remove before matching a path.
+//
+// In mode on a request needs a valid key; it then carries the key's tenant in
+// X-Scope-OrgID and a denied request is answered here with the decision's
+// status. In shadow mode the request is never denied or changed.
+func (a *adminStore) requestAuthorizer(promPrefix string) api.RequestAuthorizer {
+	mode := a.cfg.enforceAuthMode()
+	if mode == xstenant.EnforceOff {
+		return nil
+	}
+	return func(w http.ResponseWriter, r *http.Request) bool {
+		d := a.reader.CheckAuth(xstenant.AuthRequest{
+			Kind:          xstenant.KindMetrics,
+			Method:        r.Method,
+			Path:          r.URL.RequestURI(),
+			PathPrefix:    promPrefix,
+			Authorization: r.Header.Get("Authorization"),
+			OrgID:         r.Header.Get(user.OrgIDHeaderName),
+		}, mode)
+		if !d.Allowed {
+			http.Error(w, d.Message, d.Status)
+			return false
+		}
+		if d.Enforced {
+			r.Header.Set(user.OrgIDHeaderName, d.Tenant)
+		}
+		return true
 	}
 }
 
@@ -266,6 +318,9 @@ func (t *Mimir) initAdminStore() (services.Service, error) {
 
 	// The admin store is the only source of per-tenant limits.
 	t.TenantLimits = a.tenantLimits()
+	// Routes read the authorizer when a request arrives, so the order of module
+	// initialisation does not matter.
+	t.API.SetRequestAuthorizer(a.requestAuthorizer(t.Cfg.API.PrometheusHTTPPrefix))
 	t.API.RegisterUserLimits(validation.UserLimitsHandler(t.Cfg.LimitsConfig, t.TenantLimits))
 	return a.service(), nil
 }
