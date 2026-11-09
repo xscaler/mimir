@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"path"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/felixge/fgprof"
@@ -28,6 +27,7 @@ import (
 	"github.com/grafana/dskit/server"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/atomic"
 
 	"github.com/grafana/mimir/pkg/alertmanager"
 	"github.com/grafana/mimir/pkg/alertmanager/alertmanagerpb"
