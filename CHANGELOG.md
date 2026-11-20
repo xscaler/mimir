@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.2.6
+
+### Grafana Mimir
+
+* [BUGFIX] Upgrade Go to 1.26.11 to address [CVE-2026-97054](https://pkg.go.dev/vuln/GO-2026-6859). #17376
+* [BUGFIX] Update `github.com/klauspost/compress` to v1.20.2 to address [CVE-2026-116591](https://pkg.go.dev/vuln/GO-2026-6865). #17209
+* [BUGFIX] Update the OpenTelemetry libraries to v1.47.0 to address [CVE-2026-81871](https://nvd.nist.gov/vuln/detail/CVE-2026-81871), [CVE-2026-81872](https://pkg.go.dev/vuln/GO-2026-6615), and [CVE-2026-128085](https://github.com/advisories/GHSA-q7gw-24fr-5p69). #17394
+
+## 3.2.5
+
+### Grafana Mimir
+
+* [CHANGE] Alertmanager: Enforce that SNS receivers provide explicit credentials (access key and secret key) by default. This prevents malicious users from creating a SNS receiver with a custom URL that then receives the Alertmanager's AWS credentials. The existing behaviour can be restored by setting `-alertmanager.require-explicit-sns-credentials=false`. #17320
+* [CHANGE] Alertmanager: Reject SNS receivers that set `use_aws_http_client`. The AWS SDK HTTP client does not use the Alertmanager receivers firewall, so this setting could be used to reach addresses blocked by `-alertmanager.receivers-firewall-block-private-addresses` or `-alertmanager.receivers-firewall-block-cidr-networks`. #17320
+* [CHANGE] Alertmanager: Enforce restrictions on tenant configuration when loading configuration from storage, not just when receiving it via API. This ensures that new restrictions introduced cannot be circumvented by existing config. Existing tenants' configuration that fails validation can be exempted from this restriction with `-alertmanager.tenants-exempt-from-config-validation-for-existing-config`. #17320
+
 ## 3.2.4
 
 ### Grafana Mimir
